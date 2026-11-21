@@ -285,3 +285,64 @@ def test_overwriting_keeps_the_file_permissions(model, tmp_path):
     os.chmod(out, 0o640)
     model.save_document(str(out))
     assert stat.S_IMODE(out.stat().st_mode) == 0o640
+
+
+# -- Adding text and erasing -----------------------------------------------------
+
+from erase import ErasePlan, FILL_COLOR  # noqa: E402
+from textedit import TextStyle  # noqa: E402
+
+
+def test_add_text_is_one_undo_step(model):
+    label = model.add_text(0, (60, 300), "Added note", TextStyle(size=14))
+    assert label == "Add “Added note”"
+    assert "Added note" in _page_text(model)
+    assert model.history_entries()[-1] == label and model.is_dirty
+    model.undo()
+    assert "Added note" not in _page_text(model)
+
+
+def test_add_text_errors_change_nothing(model):
+    with pytest.raises(te.EditError, match="can't draw"):
+        model.add_text(0, (60, 300), "漢字", TextStyle())
+    assert model.history_entries() == ["Original"]
+
+
+def test_add_text_rolls_back_on_failure(model, monkeypatch):
+    monkeypatch.setattr("editor.apply_add_text",
+                        lambda page, plan: (page.insert_text((10, 10), "junk"),
+                                            (_ for _ in ()).throw(te.EditError("nope"))))
+    before = _page_text(model)
+    with pytest.raises(te.EditError, match="nope"):
+        model.add_text(0, (60, 300), "x", TextStyle())
+    assert _page_text(model) == before
+    assert model.history_entries() == ["Original"]
+
+
+def test_erase_words_is_one_undo_step(model):
+    words = [w for w in model.words(0) if w.text in ("line", "to")
+             and abs(w.chars[0].origin[1] - 162) < 0.5]
+    label = model.erase(ErasePlan(0, words=words))
+    assert label == "Erase “line to”"
+    assert "Target edit" in " ".join(_page_text(model).split())
+    model.undo()
+    assert TARGET in _page_text(model)
+
+
+def test_erase_nothing_raises_and_changes_nothing(model):
+    import pymupdf as _p
+    with pytest.raises(te.EditError, match="nothing to erase"):
+        model.erase(ErasePlan(0, area=_p.Rect(300, 400, 400, 450)))
+    assert model.history_entries() == ["Original"]
+    assert TARGET in _page_text(model)
+
+
+def test_erase_then_save(model, tmp_path):
+    words = [w for w in model.words(0) if w.text == "Quarterly"]
+    model.erase(ErasePlan(0, words=words, fill=FILL_COLOR))
+    out = tmp_path / "erased.pdf"
+    model.save_document(str(out))
+    saved = pymupdf.open(str(out))
+    assert "Quarterly" not in saved[0].get_text()
+    assert "Report" in saved[0].get_text()
+    saved.close()

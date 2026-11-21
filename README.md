@@ -1,29 +1,60 @@
 # PDF Editor
 
-A small macOS app for editing the text in a PDF the way you'd edit a text
-document. Click any line and type, then press Return. The new text keeps the
-original font, size, colour and position. The old text is actually removed
-from the file, not just covered up.
+A small macOS app for editing a PDF the way you'd edit a text document:
+
+- **Edit text.** Click any line and type. The new text keeps the original
+  font, size, colour and position.
+- **Add text** anywhere on the page.
+- **Erase** words, whole sentences, or any rectangle. Real text just
+  disappears. Scanned or image content is filled to match its surroundings,
+  paper grain included.
+
+Replaced and erased text is actually removed from the file, not just covered
+up.
 
 Sister app to [PDF Redactor](https://github.com/DevTamer/pdf-redactor-for-mac).
 Both are built on [pdfcore](https://github.com/DevTamer/pdfcore).
 
-> **Status: early (v0.1).** Single-line edits work well, including on
-> real-world PDFs with subset fonts. See [Limitations](#limitations) for what
-> it doesn't do yet.
+> **Status: early (v0.2).** Single-line edits, added text and erasing work
+> well, including on real-world PDFs with subset fonts and on scans. See
+> [Limitations](#limitations) for what it doesn't do yet.
 
 ## Using it
 
-1. **File → Open…** (`Cmd+O`), or drop a PDF onto the app icon.
-2. Hover over text: editable text gets a dashed blue outline.
-3. Click it, type, then press **Return** to apply or **Esc** to cancel.
-   Clicking elsewhere also applies. Clearing the box and pressing Return
-   deletes that text.
-4. **Undo/Redo** (`Cmd+Z` / `Cmd+Shift+Z`), or click any entry in the
-   **History** panel to jump back to it.
-5. **Save** (`Cmd+S`) or **Save As…** (`Cmd+Shift+S`). The first save
-   suggests `<name>_edited.pdf`. Your original file is only replaced if you
-   choose to save over it.
+Open a PDF with **File → Open…** (`Cmd+O`), or drop one onto the app icon.
+Then pick a tool from the toolbar or the **Tools** menu:
+
+| Tool | Shortcut | What you do |
+|---|---|---|
+| ✎ **Edit Text** | `Cmd+1` | Hover: editable text gets a dashed blue outline. Click it, type, then press **Return** to apply or **Esc** to cancel. Clicking elsewhere also applies. Clearing the box deletes the text. |
+| + **Add Text** | `Cmd+2` | Click where the new text should start and type. Choose the font (Helvetica, Times, Courier), size, bold, italic and colour in the sidebar. Return adds it. |
+| ⌫ **Erase** | `Cmd+3` | Click a word to erase it. Drag from one word to another to erase everything between them, like selecting text. Drag from empty space to erase everything in a rectangle. |
+
+Every change is one step in the **History** panel. Use **Undo/Redo**
+(`Cmd+Z` / `Cmd+Shift+Z`), or click any entry to jump back to it.
+
+**Save** (`Cmd+S`) or **Save As…** (`Cmd+Shift+S`). The first save suggests
+`<name>_edited.pdf`. Your original file is only replaced if you choose to
+save over it.
+
+### What erasing leaves behind
+
+- **Real text** simply disappears. Whatever was behind it shows through:
+  white paper, a coloured box, a photo. Nothing is painted over it.
+- **Scanned pages** (and photos or screenshots) are images, so the letters
+  are pixels. Often there's also an invisible OCR text layer on top, and
+  that is removed too. The erased spot is filled in the image itself, from
+  its surroundings. Pick the fill in the Erase panel:
+  - **Content-aware fill** (default) continues gradients, paper tone and
+    grain.
+  - **Background colour** paints the surrounding colour.
+
+  The image is stored as before, so a JPEG scan stays a JPEG of the same
+  size.
+- **Shapes in an erased rectangle** (a logo or stamp drawn as vector
+  graphics) are covered with a fill. They're never deleted, so larger
+  shapes the rectangle merely sits inside, like a page border, are
+  unaffected.
 
 ### Fonts, and when you'll see a warning
 
@@ -39,7 +70,7 @@ doesn't have, the app draws that character with the closest standard font
 Everything else stays in the original font. You'll also be warned if the
 original font isn't embedded at all, or if longer text would run into the
 text that follows it on the same line. Characters that no available font
-can draw, such as most non-Latin scripts in v0.1, are refused rather than
+can draw, such as most non-Latin scripts for now, are refused rather than
 written as blank boxes.
 
 ## How an edit works
@@ -73,20 +104,30 @@ The details are in the docstring at the top of [`textedit.py`](textedit.py).
 ## Limitations
 
 - **One line at a time.** Text doesn't reflow onto other lines. Longer text
-  can run into what follows it on the same line (you're warned first).
+  can run into what follows it on the same line (you're warned first). Added
+  text is a single line.
 - **Horizontal text on unrotated pages only.** Rotated pages and vertical
-  text are refused.
+  text are refused for all three tools.
 - **Spacing is the font's own.** Justified lines that relied on per-word
   positioning, character spacing or horizontal scaling come back with
   natural spacing.
-- **Drawing order.** Edited text is drawn on top of the page's other
-  content. If a shape used to be drawn *over* that text (a highlight, a
-  strike-through line), the text now sits above it.
-- **Substitute fonts are standard fonts.** A missing character uses
-  Helvetica, Times or Courier, so in a distinctive typeface it will look
-  different.
-- **No new text.** You can't yet add text where there was none, or change a
-  run's font, size or colour.
+- **Drawing order.** Edited and added text is drawn on top of the page's
+  other content. If a shape used to be drawn *over* that text (a highlight,
+  a strike-through line), the text now sits above it.
+- **Standard fonts for new and substitute characters.** Added text, and any
+  character missing from a PDF's embedded font, uses Helvetica, Times or
+  Courier.
+- **Erasing shapes covers them.** Vector graphics in an erased rectangle are
+  covered with a fill rather than removed from the file. Images shown more
+  than once in the document, or with transparency, are also covered with a
+  fill rather than edited, so their other copies aren't changed.
+- **Content-aware fill isn't magic.** It's made for backgrounds: paper,
+  gradients, noise, flat colour. Erasing across detailed photo content
+  leaves a soft smudge.
+- **Erasing is not redaction.** Pixels erased from a scan really are
+  replaced, and erased text is removed. But for removing sensitive content
+  with nothing left behind (metadata, hidden layers and so on), use
+  [PDF Redactor](https://github.com/DevTamer/pdf-redactor-for-mac).
 - The app is unsigned and not notarized. The first time, open it with
   right-click → **Open** → **Open**.
 
@@ -111,16 +152,19 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The suite has four parts:
+The suite has five parts:
 
-- `test_textedit.py` covers the editing engine. It runs headless, on
+- `test_erase.py` covers erasing: selections, fills (including paper grain),
+  text removal, in-place scan edits (JPEG and 1-bit stay compact), and
+  covering leftover shapes.
+- `test_textedit.py` covers the editing and add-text engine. It runs headless, on
   generated PDFs plus one real-world PDF made by macOS's own text system
   (`tests/fixtures/coretext_sample.pdf`, regenerated with
   `tests/fixtures/make_coretext_sample.swift`).
 - `test_model.py` covers undo, rollback after a failed edit, unsaved-changes
   tracking and saving.
-- `test_gui_smoke.py` drives the real window: hover, click, type, Return and
-  Esc, dialogs, undo, save. It skips itself if Tk can't open a window, and it
+- `test_gui_smoke.py` drives the real window: all three tools, hover, click,
+  drag, type, Return and Esc, dialogs, undo, save. It skips itself if Tk can't open a window, and it
   fails rather than hangs if any unexpected dialog would appear.
 - `test_startup.py` covers startup ordering and import hygiene.
 
@@ -154,18 +198,28 @@ the test suite there, then builds `packaging/dist/PDF Editor.app` and
 
 ## Architecture
 
-- [`textedit.py`](textedit.py) is the editing engine, with no Tk. It finds
-  text runs, picks fonts, plans an edit (warnings and errors included) and
-  applies it with verification.
+- [`textedit.py`](textedit.py) is the editing and add-text engine, with no
+  Tk. It finds text runs, picks fonts, plans an edit (warnings and errors
+  included) and applies it with verification.
+- [`erase.py`](erase.py) is the erase engine, with no Tk. It handles words
+  and selections, removing text character by character, the fills, in-place
+  image edits and covering patches.
 - [`editor.py`](editor.py) is the app:
-  - `EditorModel` builds on pdfcore's `DocumentSession`. It adds edits as
-    undo steps, rollback on failure, unsaved-changes tracking and atomic
-    saving.
-  - `EditCanvas` builds on pdfcore's `PageView`. It handles the hover
-    outline, click hit-testing and the inline text box.
-  - `EditorApp` is the window, menus and sidebar.
+  - `EditorModel` builds on pdfcore's `DocumentSession`. Every change is an
+    undo step with rollback on failure. It also tracks unsaved changes and
+    saves atomically.
+  - `EditCanvas` builds on pdfcore's `PageView` and handles the mouse for
+    each tool and the inline text box.
+  - `EditorApp` is the window, the tools, menus and sidebar.
 
-Saving always writes from a serialized copy of the document. In PyMuPDF
-1.24, a garbage-collecting save of a document that has newly written text
-can blank the live document's pages; `test_live_document_survives_saving`
-guards against this.
+PyMuPDF quirks the code works around, each with a regression test:
+
+- **Saving can blank the open document.** In PyMuPDF 1.24, a
+  garbage-collecting save of a document with newly written text can blank
+  its pages, so saving always writes from a serialized copy.
+- **Replacing an image leaves a copy behind.** `Page.replace_image` leaves a
+  second copy of the image in the file, so erased images are rewritten in
+  place instead.
+- **The image cache goes stale.** MuPDF caches decoded images, so it's
+  flushed after an image is rewritten. `page.refresh()` would also work, but
+  it fails while anything else holds the page.

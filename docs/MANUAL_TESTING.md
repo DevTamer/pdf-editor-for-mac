@@ -1,8 +1,8 @@
 # Manual testing checklist
 
-The automated suite covers the editing engine, the model and the app's
-handlers, using simulated events. It can't press real keys, see real
-dialogs, or judge how an edit *looks*. Run this checklist against the built
+The automated suite covers the editing, add-text and erase engines, the
+model and the app's handlers, using simulated events. It can't press real
+keys, see real dialogs, or judge how an edit *looks*. Run this checklist against the built
 app (`packaging/PDF Editor.dmg`) before a release, after changes to
 `EditCanvas` / `EditorApp`, and after bumping the pinned pdfcore version.
 
@@ -10,7 +10,7 @@ Use a few real PDFs:
 
 - one exported from Word or Pages,
 - one from a browser's "Save as PDF",
-- one scanned-then-OCR'd if you have it,
+- one scanned-then-OCR'd, for the Erase tool,
 - and `tests/fixtures/coretext_sample.pdf`.
 
 ## Launch and open
@@ -46,6 +46,40 @@ Use a few real PDFs:
       unless you add new characters.
 - [ ] Copy the edited text from the saved file in Preview and paste it
       somewhere: it should be exactly what you typed, with normal spaces.
+
+## Tools
+
+- [ ] The toolbar buttons, the Tools menu and Cmd+1/2/3 all switch tools,
+      and the sidebar shows that tool's panel.
+- [ ] Switching tools while a text box is open applies it first.
+
+## Add Text
+
+- [ ] Clicking on the page opens an empty box there, in the chosen font,
+      size and colour. Changing them in the sidebar updates the box.
+- [ ] Return adds the text with its top-left where you clicked. Clicking
+      somewhere else adds it and opens a new box.
+- [ ] Bold, Italic and Colour… all show up in the added text.
+- [ ] Added text can be edited afterwards with the Edit tool, with no font
+      warning.
+- [ ] Typing e.g. 漢字 shows an error and keeps the box open.
+
+## Erase
+
+- [ ] Hovering a word outlines it in red. Clicking it erases just that word.
+- [ ] Dragging from one word to another highlights everything between them,
+      across lines, and erases it on release.
+- [ ] Dragging from empty space draws a dashed rectangle and erases what's
+      inside. A tiny accidental drag does nothing.
+- [ ] Erasing real text shows exactly what was behind it: white paper, or a
+      coloured box or photo. No box is painted.
+- [ ] On a scanned, OCR'd PDF: erasing a word removes it from the scan
+      image, and the fill blends with the paper (grain included). The saved
+      file is about the same size as before.
+- [ ] Background colour fill paints a flat colour instead.
+- [ ] Erasing a rectangle over a logo or stamp hides it. A page border
+      around it stays.
+- [ ] Erasing empty space shows "There was nothing to erase there."
 
 ## Undo, history, saving
 

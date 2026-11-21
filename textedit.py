@@ -652,3 +652,95 @@ def _reads_back(page: pymupdf.Page, plan: EditPlan) -> bool:
                 and wanted in _collapse(run.text)):
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Adding new text
+# ---------------------------------------------------------------------------
+
+FAMILIES = {"Helvetica": ("helv", "hebo", "heit", "hebi"),
+            "Times": ("tiro", "tibo", "tiit", "tibi"),
+            "Courier": ("cour", "cobo", "coit", "cobi")}
+
+
+@dataclass(frozen=True)
+class TextStyle:
+    """How new text looks. Uses the standard fonts every PDF viewer has."""
+
+    family: str = "Helvetica"
+    size: float = 12.0
+    bold: bool = False
+    italic: bool = False
+    color: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+    @property
+    def font_code(self) -> str:
+        return FAMILIES[self.family][(1 if self.bold else 0) + (2 if self.italic else 0)]
+
+    @property
+    def label(self) -> str:
+        return FONT_LABELS[self.font_code]
+
+
+@dataclass
+class AddPlan:
+    page_num: int
+    top_left: Tuple[float, float]      # where the text box was placed
+    text: str
+    style: TextStyle
+    origin: Tuple[float, float] = (0.0, 0.0)   # baseline start
+    width: float = 0.0
+    errors: List[str] = field(default_factory=list)
+
+    @property
+    def can_apply(self) -> bool:
+        return not self.errors and bool(self.text.strip())
+
+
+MIN_SIZE, MAX_SIZE = 4.0, 144.0
+
+
+def plan_add_text(page: pymupdf.Page, page_num: int,
+                  top_left: Tuple[float, float], text: str,
+                  style: TextStyle) -> AddPlan:
+    """Plan writing ``text`` with its top-left corner at ``top_left``."""
+    plan = AddPlan(page_num=page_num, top_left=top_left, text=text, style=style)
+    if style.family not in FAMILIES:
+        plan.errors.append(f"Unknown font family “{style.family}”.")
+        return plan
+    if not MIN_SIZE <= style.size <= MAX_SIZE:
+        plan.errors.append(f"Font size must be between {MIN_SIZE:g} and "
+                           f"{MAX_SIZE:g} pt.")
+    if page.rotation:
+        plan.errors.append("Adding text to rotated pages isn't supported yet.")
+    if any(c in text for c in "\r\n\t") or any(ord(c) < 32 for c in text):
+        plan.errors.append("Line breaks, tabs and control characters "
+                           "aren't supported in added text.")
+    font = pymupdf.Font(style.font_code)
+    missing = _unique(c for c in text if not font.has_glyph(ord(c)))
+    if missing:
+        plan.errors.append(f"{style.label} can't draw these characters: "
+                           + " ".join(missing))
+    x, y = top_left
+    plan.origin = (x, y + font.ascender * style.size)
+    plan.width = font.text_length(text, fontsize=style.size)
+    return plan
+
+
+def apply_add_text(page: pymupdf.Page, plan: AddPlan) -> None:
+    """Write planned new text, verifying it reads back. Raises EditError;
+    the caller restores the page on failure."""
+    if not plan.can_apply:
+        raise EditError(plan.errors[0] if plan.errors else "There's no text to add.")
+    expected = _char_counts(page) + _counted(plan.text)
+    writer = pymupdf.TextWriter(page.rect)
+    writer.append(plan.origin, plan.text, font=pymupdf.Font(plan.style.font_code),
+                  fontsize=plan.style.size)
+    writer.write_text(page, color=plan.style.color)
+    probe = EditPlan(run=TextRun(plan.page_num, "", "", plan.style.size, 0,
+                                 plan.style.color, plan.origin, (0, 0, 0, 0),
+                                 (1.0, 0.0)),
+                     new_text=plan.text, new_width=plan.width)
+    if _char_counts(page) != expected or not _reads_back(page, probe):
+        raise EditError("The new text couldn't be verified after writing "
+                        "it, so nothing was added.")

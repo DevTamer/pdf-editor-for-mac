@@ -486,3 +486,101 @@ def test_coretext_each_font_round_trips_its_own_text(coretext_doc):
         assert reason == "", run.font
         plan = te.plan_edit(coretext_doc, page, run, run.text + "!")
         assert plan.can_apply, (run.font, plan.errors)
+
+
+# ---------------------------------------------------------------------------
+# Adding new text
+# ---------------------------------------------------------------------------
+
+def _added(doc, text):
+    return next(r for r in te.page_runs(doc[0], 0) if r.text == text)
+
+
+@pytest.mark.parametrize("style, font_name", [
+    (te.TextStyle(), "NimbusSans-Regular"),
+    (te.TextStyle("Times", 18, bold=True, italic=True), "NimbusRoman-BoldItalic"),
+    (te.TextStyle("Courier", 9, bold=True), "NimbusMonoPS-Bold"),
+])
+def test_add_text_with_style(sample_doc, style, font_name):
+    page = sample_doc[0]
+    plan = te.plan_add_text(page, 0, (60, 300), "Newly added", style)
+    assert plan.can_apply
+    te.apply_add_text(page, plan)
+
+    run = _added(sample_doc, "Newly added")
+    assert run.font == font_name
+    assert run.size == pytest.approx(style.size)
+    # The click point is the top-left of the text: the baseline sits one
+    # ascender below it.
+    ascender = pymupdf.Font(style.font_code).ascender
+    assert run.origin == pytest.approx((60, 300 + ascender * style.size), abs=0.01)
+    assert 300 - 1 <= run.bbox[1] <= 300 + 0.3 * style.size
+
+
+def test_add_text_colour_and_nothing_else_changes(sample_doc):
+    before = _texts(sample_doc)
+    page = sample_doc[0]
+    te.apply_add_text(page, te.plan_add_text(
+        page, 0, (60, 300), "Red note", te.TextStyle(color=(0.8, 0.1, 0.1))))
+    assert _added(sample_doc, "Red note").color == pytest.approx((0.8, 0.1, 0.1), abs=0.01)
+    assert sorted(_texts(sample_doc)) == sorted(before + ["Red note"])
+
+
+def test_added_text_can_be_edited_without_warnings(sample_doc):
+    page = sample_doc[0]
+    te.apply_add_text(page, te.plan_add_text(page, 0, (60, 300), "Draft",
+                                             te.TextStyle("Times", 14)))
+    plan = te.plan_edit(sample_doc, page, _added(sample_doc, "Draft"), "Final")
+    assert plan.warnings == [] and plan.can_apply
+    te.apply_edit(page, plan)
+    assert "Final" in _texts(sample_doc)
+
+
+@pytest.mark.parametrize("text, style, message", [
+    ("漢字", te.TextStyle(), "can't draw"),
+    ("two\nlines", te.TextStyle(), "Line breaks"),
+    ("ok", te.TextStyle(size=2), "between"),
+    ("ok", te.TextStyle(size=500), "between"),
+    ("ok", te.TextStyle(family="Comic Sans"), "Unknown font"),
+])
+def test_add_text_rejects_bad_input(sample_doc, text, style, message):
+    plan = te.plan_add_text(sample_doc[0], 0, (60, 300), text, style)
+    assert not plan.can_apply
+    assert message in plan.errors[0]
+    with pytest.raises(te.EditError):
+        te.apply_add_text(sample_doc[0], plan)
+
+
+def test_add_text_rejects_rotated_pages(sample_doc):
+    sample_doc[0].set_rotation(90)
+    plan = te.plan_add_text(sample_doc[0], 0, (60, 300), "x", te.TextStyle())
+    assert any("rotated" in e for e in plan.errors)
+
+
+def test_add_whitespace_only_is_not_appliable(sample_doc):
+    plan = te.plan_add_text(sample_doc[0], 0, (60, 300), "   ", te.TextStyle())
+    assert not plan.can_apply
+    with pytest.raises(te.EditError, match="no text"):
+        te.apply_add_text(sample_doc[0], plan)
+
+
+def test_add_text_verification_catches_a_wrong_result(sample_doc, monkeypatch):
+    """Make PyMuPDF write the characters reversed: same letters (so counts
+    match), wrong order, which only the read-back check can catch."""
+    real_append = pymupdf.TextWriter.append
+
+    def reversed_append(self, pos, text, *args, **kwargs):
+        return real_append(self, pos, text[::-1], *args, **kwargs)
+    monkeypatch.setattr(pymupdf.TextWriter, "append", reversed_append)
+
+    page = sample_doc[0]
+    plan = te.plan_add_text(page, 0, (60, 300), "Checked", te.TextStyle())
+    with pytest.raises(te.EditError, match="couldn't be verified"):
+        te.apply_add_text(page, plan)
+
+
+def test_style_font_codes():
+    assert te.TextStyle().font_code == "helv"
+    assert te.TextStyle("Times", bold=True).font_code == "tibo"
+    assert te.TextStyle("Courier", italic=True).font_code == "coit"
+    assert te.TextStyle("Helvetica", bold=True, italic=True).label == "Helvetica Bold Oblique"

@@ -319,3 +319,196 @@ def test_password_protected_pdf_shows_an_error(app, tmp_path, monkeypatch):
     assert app.model.file_path.endswith("sample.pdf")
     assert app.root.title().endswith("sample.pdf")
     assert app.canvas.find_withtag("page_image")
+
+
+# -- Tools -----------------------------------------------------------------------
+
+def _press_move_release(app, start, end=None, steps=3):
+    view = app.view
+    view._on_click(_Event(*start))
+    if end is not None:
+        for i in range(1, steps + 1):
+            x = start[0] + (end[0] - start[0]) * i / steps
+            y = start[1] + (end[1] - start[1]) * i / steps
+            view._on_drag(_Event(x, y))
+    view._on_release(_Event(*(end or start)))
+
+
+def _word_center(app, text, baseline=None):
+    words = [w for w in app.model.words(0) if w.text == text
+             and (baseline is None or abs(w.chars[0].origin[1] - baseline) < 0.5)]
+    assert len(words) == 1, [w.text for w in words]
+    x0, y0, x1, y1 = words[0].bbox
+    return ((x0 + x1) / 2 * SCALE, (y0 + y1) / 2 * SCALE)
+
+
+def test_tool_switching_shows_the_right_panel(app):
+    for tool in ("add", "erase", "edit"):
+        app.set_tool(tool)
+        assert app.view.tool == tool
+        assert app.tool_var.get() == tool
+        shown = [t for t, panel in app.tool_panels.items() if panel.winfo_manager()]
+        assert shown == [tool]
+    app.set_tool("erase")
+    assert str(app.canvas.cget("cursor")) == "crosshair"
+    app.set_tool("add")
+    assert str(app.canvas.cget("cursor")) == "xterm"
+
+
+def test_switching_tool_applies_an_open_edit(app):
+    _click(app, TARGET)
+    _type(app, "Applied on tool switch")
+    app.set_tool("erase")
+    assert app.view.entry is None
+    assert "Applied on tool switch" in _page_text(app)
+
+
+def test_add_text_tool(app):
+    app.set_tool("add")
+    app.family_var.set("Times")
+    app.size_var.set("20")
+    app.bold_var.set(True)
+    app.view._on_click(_Event(60 * SCALE, 300 * SCALE))
+    assert app.view.entry is not None and app.view.entry.get() == ""
+    _type(app, "Brand new line")
+    _press(app, "<Return>")
+
+    run = next(r for r in app.model.runs(0) if r.text == "Brand new line")
+    assert run.font == "NimbusRoman-Bold" and run.size == pytest.approx(20)
+    assert run.origin[0] == pytest.approx(60, abs=1)
+    assert app.history_list.size() == 2
+    assert "Add “Brand new line”" in app.status_label["text"]
+
+
+def test_add_text_colour_picker(app, monkeypatch):
+    monkeypatch.setattr(editor.colorchooser, "askcolor",
+                        lambda **k: ((0, 128, 255), "#0080ff"))
+    app.set_tool("add")
+    app._choose_color()
+    assert str(app.color_swatch.cget("bg")) == "#0080ff"
+    app.view._on_click(_Event(60 * SCALE, 300 * SCALE))
+    assert str(app.view.entry.cget("fg")) == "#0080ff"
+    _type(app, "Blue text")
+    app._commit_inline_edit()
+    run = next(r for r in app.model.runs(0) if r.text == "Blue text")
+    assert run.color == pytest.approx((0, 128 / 255, 1), abs=0.01)
+
+
+def test_style_change_restyles_the_open_box(app):
+    app.set_tool("add")
+    app.view._on_click(_Event(60 * SCALE, 300 * SCALE))
+    app.size_var.set("30")
+    size_px = abs(int(app.root.tk.call("font", "actual",
+                                       app.view.entry.cget("font"), "-size")))
+    assert size_px == pytest.approx(30 * SCALE, abs=1.5)
+
+
+def test_add_text_error_keeps_the_box_open(app, monkeypatch):
+    shown = []
+    monkeypatch.setattr(editor.messagebox, "showerror",
+                        lambda title, message: shown.append(message))
+    app.set_tool("add")
+    app.view._on_click(_Event(60 * SCALE, 300 * SCALE))
+    _type(app, "漢字")
+    assert app._commit_inline_edit() is False
+    assert shown and "can't draw" in shown[0]
+    assert app.view.entry is not None
+    assert app.history_list.size() == 1
+
+
+def test_add_text_empty_or_escape_adds_nothing(app):
+    app.set_tool("add")
+    app.view._on_click(_Event(60 * SCALE, 300 * SCALE))
+    _press(app, "<Return>")                       # empty
+    assert app.view.entry is None
+    app.view._on_click(_Event(60 * SCALE, 300 * SCALE))
+    _type(app, "never mind")
+    _press(app, "<Escape>")
+    assert app.view.entry is None
+    assert app.history_list.size() == 1
+
+
+def test_clicking_again_in_add_mode_commits_and_starts_new_text(app):
+    app.set_tool("add")
+    app.view._on_click(_Event(60 * SCALE, 300 * SCALE))
+    _type(app, "First note")
+    app.view._on_click(_Event(60 * SCALE, 340 * SCALE))
+    assert "First note" in _page_text(app)
+    assert app.view.entry is not None and app.view.entry.get() == ""
+
+
+def test_erase_hover_outlines_words(app):
+    app.set_tool("erase")
+    app.view._on_motion(_Event(*_word_center(app, "Report")))
+    assert len(app.canvas.find_withtag("hover")) == 1
+    app.view._on_motion(_Event(450 * SCALE, 500 * SCALE))
+    assert app.canvas.find_withtag("hover") == ()
+
+
+def test_erase_click_erases_one_word(app):
+    app.set_tool("erase")
+    _press_move_release(app, _word_center(app, "Report"))
+    text = _page_text(app)
+    assert "Report" not in text and "Quarterly" in text
+    assert app.history_list.size() == 2
+    assert "Erase “Report”" in app.status_label["text"]
+
+
+def test_erase_drag_across_words_erases_the_phrase(app):
+    app.set_tool("erase")
+    start = _word_center(app, "line", baseline=162)   # "Target line to edit"
+    end = _word_center(app, "to", baseline=162)
+    # Show the selection while dragging, before release.
+    app.view._on_click(_Event(*start))
+    app.view._on_drag(_Event(*end))
+    assert [w.text for w in app.view.selection] == ["line", "to"]
+    assert len(app.canvas.find_withtag("erase_sel")) == 2
+    app.view._on_release(_Event(*end))
+
+    words = " ".join(_page_text(app).split())
+    assert "Target edit" in words
+    assert app.canvas.find_withtag("erase_sel") == ()
+
+
+def test_erase_rectangle_from_empty_space(app):
+    app.set_tool("erase")
+    run = next(r for r in app.model.runs(0) if r.text.strip() == "APPROVED")
+    x0, y0, x1, y1 = run.bbox
+    _press_move_release(app, ((x0 - 3) * SCALE, (y0 - 3) * SCALE),
+                        ((x1 + 3) * SCALE, (y1 + 3) * SCALE))
+    assert "APPROVED" not in _page_text(app)
+    assert "Status:" in _page_text(app)
+
+
+def test_tiny_drag_on_empty_space_does_nothing(app):
+    app.set_tool("erase")
+    _press_move_release(app, (450 * SCALE, 500 * SCALE),
+                        (450 * SCALE + 2, 500 * SCALE + 2))
+    assert app.history_list.size() == 1
+
+
+def test_erasing_empty_area_shows_a_message(app, monkeypatch):
+    shown = []
+    monkeypatch.setattr(editor.messagebox, "showerror",
+                        lambda title, message: shown.append(message))
+    app.set_tool("erase")
+    _press_move_release(app, (300 * SCALE, 400 * SCALE), (400 * SCALE, 450 * SCALE))
+    assert shown and "nothing to erase" in shown[0]
+    assert app.history_list.size() == 1
+
+
+def test_erase_uses_the_chosen_fill(app, monkeypatch):
+    seen = []
+    monkeypatch.setattr(app.model, "erase",
+                        lambda plan: seen.append(plan.fill) or "Erase")
+    app.set_tool("erase")
+    app.fill_var.set("color")
+    _press_move_release(app, _word_center(app, "Report"))
+    assert seen == ["color"]
+
+
+def test_undo_after_erase(app):
+    app.set_tool("erase")
+    _press_move_release(app, _word_center(app, "Report"))
+    app._on_undo()
+    assert "Quarterly Report" in _page_text(app)

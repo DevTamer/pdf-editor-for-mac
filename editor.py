@@ -1,5 +1,5 @@
 """
-PDF Editor — click any text in a PDF and edit it in place.
+PDF Editor — edit, add and erase text in a PDF like a text document.
 
 Usage:
     source venv/bin/activate && python editor.py [file.pdf]
@@ -19,16 +19,22 @@ configure_bundled_tcl_tk()
 
 import tempfile  # noqa: E402
 import tkinter as tk  # noqa: E402  (must follow configure_bundled_tcl_tk)
-from tkinter import ttk, filedialog, messagebox  # noqa: E402
-from typing import List, Optional  # noqa: E402
+from tkinter import colorchooser, filedialog, messagebox, ttk  # noqa: E402
+from typing import Callable, List, Optional, Tuple  # noqa: E402
 
 import pymupdf  # noqa: E402
 
 from pdfcore import DocumentSession, PDFRenderer  # noqa: E402
 from pdfcore.pageview import PageView  # noqa: E402
 
+from erase import (  # noqa: E402
+    FILL_COLOR, FILL_CONTENT, ErasePlan, Word, apply_erase, page_words,
+    word_at, words_between,
+)
 from textedit import (  # noqa: E402
-    EditError, EditPlan, TextRun, apply_edit, page_runs, plan_edit,
+    FAMILIES, MAX_SIZE, MIN_SIZE, AddPlan, EditError, EditPlan, TextRun,
+    TextStyle,
+    apply_add_text, apply_edit, page_runs, plan_add_text, plan_edit,
     resolve_original_font, run_at,
 )
 
@@ -43,12 +49,19 @@ MIN_WINDOW_HEIGHT = 600
 SIDEBAR_WIDTH = 280
 HISTORY_LIMIT = 30  # Max snapshots kept in the undo/redo history
 
+TOOL_EDIT = "edit"
+TOOL_ADD = "add"
+TOOL_ERASE = "erase"
+TOOLS = (TOOL_EDIT, TOOL_ADD, TOOL_ERASE)
+
 HOVER_OUTLINE = "#2f7ae5"
 HOVER_DASH = (3, 2)
 EDIT_BACKGROUND = "#fffbe6"
 EDIT_BORDER = "#2f7ae5"
 MIN_EDITOR_WIDTH = 160  # px
 EDITOR_EXTRA_WIDTH = 60  # px of room to type beyond the original text
+ERASE_COLOR = "#e5484d"
+MIN_MARQUEE = 4  # px: smaller drags count as clicks
 
 
 def _current_umask() -> int:
@@ -62,16 +75,26 @@ def _short(text: str, limit: int = 24) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
+def _hex(color: Tuple[float, float, float]) -> str:
+    red, green, blue = (round(max(0.0, min(1.0, c)) * 255) for c in color)
+    return f"#{red:02x}{green:02x}{blue:02x}"
+
+
+def _tk_font(family: str, size_px: float, bold: bool, italic: bool):
+    style = " ".join(s for s, on in (("bold", bold), ("italic", italic)) if on)
+    return (family, -max(8, round(size_px)), style or "normal")
+
+
 # ---------------------------------------------------------------------------
-# EditorModel — document state + text edits
+# EditorModel — document state + changes
 # ---------------------------------------------------------------------------
 
 class EditorModel(DocumentSession):
-    """The open document, its edit history, and saving.
+    """The open document, its history, and saving.
 
-    Every successful edit is one undo step. A failed edit is rolled back
-    by reloading the last snapshot, so the live document is never left
-    half-edited.
+    Every successful change (edit, added text, erase) is one undo step. A
+    failed change is rolled back by reloading the last snapshot, so the
+    live document is never left half-changed.
     """
 
     def __init__(self):
@@ -95,17 +118,20 @@ class EditorModel(DocumentSession):
 
     @property
     def is_dirty(self) -> bool:
-        """Whether there are edits that haven't been saved. Undoing back to
-        the last saved state counts as clean again."""
+        """Whether there are changes that haven't been saved. Undoing back
+        to the last saved state counts as clean again."""
         return self.doc is not None and self.history.current is not self._saved_entry
 
-    # -- Text -----------------------------------------------------------------
+    # -- Reading --------------------------------------------------------------
 
     def runs(self, page_num: int) -> List[TextRun]:
         return page_runs(self.get_page(page_num), page_num)
 
     def run_at(self, page_num: int, x: float, y: float) -> Optional[TextRun]:
         return run_at(self.runs(page_num), x, y)
+
+    def words(self, page_num: int) -> List[Word]:
+        return page_words(self.get_page(page_num))
 
     def describe_font(self, run: TextRun) -> str:
         page = self.get_page(run.page_num)
@@ -115,6 +141,27 @@ class EditorModel(DocumentSession):
         if choice.check_ink:
             return f"{run.font} (embedded)"
         return f"{run.font} (standard PDF font)"
+
+    # -- Changes --------------------------------------------------------------
+
+    def _change(self, apply: Callable[[], None], label: str) -> str:
+        """Run ``apply``; record it as one undo step, or restore the last
+        snapshot and raise EditError if it fails in any way."""
+        try:
+            apply()
+        except Exception as exc:
+            self._restore_current_snapshot()
+            if isinstance(exc, EditError):
+                raise
+            raise EditError(f"The change failed: {exc}") from exc
+        self.record_snapshot(label)
+        return label
+
+    def _restore_current_snapshot(self) -> None:
+        page = self.current_page
+        self.doc.close()
+        self.doc = self.history.current.open()
+        self.current_page = page
 
     def plan_edit(self, run: TextRun, new_text: str) -> EditPlan:
         page = self.get_page(run.page_num)
@@ -128,25 +175,39 @@ class EditorModel(DocumentSession):
             return None
         if not plan.can_apply:
             raise EditError(plan.errors[0])
-        try:
-            apply_edit(self.get_page(plan.run.page_num), plan)
-        except Exception as exc:
-            self._restore_current_snapshot()
-            if isinstance(exc, EditError):
-                raise
-            raise EditError(f"The edit failed: {exc}") from exc
         if plan.new_text.strip():
             label = f"Edit “{_short(plan.run.text)}” → “{_short(plan.new_text)}”"
         else:
             label = f"Delete “{_short(plan.run.text)}”"
-        self.record_snapshot(label)
-        return label
+        return self._change(
+            lambda: apply_edit(self.get_page(plan.run.page_num), plan), label)
 
-    def _restore_current_snapshot(self) -> None:
-        page = self.current_page
-        self.doc.close()
-        self.doc = self.history.current.open()
-        self.current_page = page
+    def plan_add_text(self, page_num: int, top_left: Tuple[float, float],
+                      text: str, style: TextStyle) -> AddPlan:
+        return plan_add_text(self.get_page(page_num), page_num, top_left,
+                             text, style)
+
+    def apply_add(self, plan: AddPlan) -> str:
+        """Write planned new text. Raises EditError (with the document
+        restored) if it can't be added."""
+        if not plan.can_apply:
+            raise EditError(plan.errors[0] if plan.errors
+                            else "There's no text to add.")
+        return self._change(
+            lambda: apply_add_text(self.get_page(plan.page_num), plan),
+            f"Add “{_short(plan.text)}”")
+
+    def add_text(self, page_num: int, top_left: Tuple[float, float], text: str,
+                 style: TextStyle) -> str:
+        """Write new text with its top-left corner at ``top_left`` (PDF
+        points). Raises EditError if it can't be added."""
+        return self.apply_add(self.plan_add_text(page_num, top_left, text, style))
+
+    def erase(self, plan: ErasePlan) -> str:
+        """Erase words or an area (see erase.py). Raises EditError if
+        there's nothing to erase or it can't be done safely."""
+        return self._change(lambda: apply_erase(self.doc, plan.page_num, plan),
+                            plan.label)
 
     # -- Saving ---------------------------------------------------------------
 
@@ -185,29 +246,45 @@ class EditorModel(DocumentSession):
 
 
 # ---------------------------------------------------------------------------
-# EditCanvas — hover, click-to-edit, inline editor
+# EditCanvas — page view + per-tool mouse handling + inline text box
 # ---------------------------------------------------------------------------
 
 class EditCanvas(PageView):
-    """Shows the page, highlights the text under the pointer, and hosts
-    the inline editor."""
+    """Shows the page and handles the mouse for the current tool:
+
+    - edit: hover outlines text; clicking it opens the inline text box.
+    - add: clicking anywhere opens an empty text box there.
+    - erase: hover outlines words; click erases a word, dragging from a
+      word selects words like a text selection, dragging from empty space
+      draws a rectangle. Releasing the mouse erases the selection.
+    """
 
     def __init__(self, canvas: tk.Canvas, model: EditorModel,
-                 renderer: PDFRenderer, on_click_run, on_click_blank):
+                 renderer: PDFRenderer, on_click_run, on_click_blank,
+                 on_add_click=None, on_erase=None):
         super().__init__(canvas, renderer)
         self.model = model
         self.on_click_run = on_click_run
         self.on_click_blank = on_click_blank
+        self.on_add_click = on_add_click or (lambda pdf_xy: None)
+        self.on_erase = on_erase or (lambda words, area: None)
+        self.tool = TOOL_EDIT
         self._runs: List[TextRun] = []
-        self._hover: Optional[TextRun] = None
+        self._words: List[Word] = []
+        self._hover = None
         self.editing_run: Optional[TextRun] = None
         self.entry: Optional[tk.Entry] = None
-        self._entry_window: Optional[int] = None
         self._on_commit = self._on_cancel = lambda: None
+        # Erase drag state
+        self._anchor_word: Optional[Word] = None
+        self._drag_start: Optional[Tuple[float, float]] = None
+        self.selection: List[Word] = []
 
         canvas.bind("<Motion>", self._on_motion)
         canvas.bind("<Leave>", lambda e: self._set_hover(None))
         canvas.bind("<ButtonPress-1>", self._on_click)
+        canvas.bind("<B1-Motion>", self._on_drag)
+        canvas.bind("<ButtonRelease-1>", self._on_release)
 
     # -- Page display ---------------------------------------------------------
 
@@ -217,77 +294,159 @@ class EditCanvas(PageView):
         self.cancel_inline_edit()
         self.show_page(self.model.get_page(page_num), page_num, fit_width)
         self._runs = self.model.runs(page_num)
+        self._words = self.model.words(page_num)
         self._hover = None
+        self._reset_drag()
+
+    def set_tool(self, tool: str) -> None:
+        if tool not in TOOLS:
+            raise ValueError(tool)
+        self.tool = tool
+        self._set_hover(None)
+        self._reset_drag()
+        self.canvas.configure(cursor={TOOL_EDIT: "", TOOL_ADD: "xterm",
+                                      TOOL_ERASE: "crosshair"}[tool])
 
     def run_at_canvas(self, cx: float, cy: float) -> Optional[TextRun]:
         px, py = self.canvas_to_pdf(cx, cy)
         return run_at(self._runs, px, py)
+
+    def word_at_canvas(self, cx: float, cy: float) -> Optional[Word]:
+        px, py = self.canvas_to_pdf(cx, cy)
+        return word_at(self._words, px, py)
+
+    def _canvas_box(self, bbox, pad: float = 0.0):
+        x0, y0 = self.pdf_to_canvas(bbox[0], bbox[1])
+        x1, y1 = self.pdf_to_canvas(bbox[2], bbox[3])
+        return x0 - pad, y0 - pad, x1 + pad, y1 + pad
 
     # -- Hover ----------------------------------------------------------------
 
     def _on_motion(self, event) -> None:
         if not self.model.doc:
             return
-        self._set_hover(self.run_at_canvas(*self.event_coords(event)))
+        xy = self.event_coords(event)
+        if self.tool == TOOL_EDIT:
+            self._set_hover(self.run_at_canvas(*xy))
+        elif self.tool == TOOL_ERASE:
+            self._set_hover(self.word_at_canvas(*xy))
 
-    def _set_hover(self, run: Optional[TextRun]) -> None:
-        if run is self._hover:
+    def _set_hover(self, item) -> None:
+        if item is self._hover:
             return
-        self._hover = run
+        self._hover = item
         self.canvas.delete("hover")
-        self.canvas.configure(cursor="xterm" if run else "")
-        if run is not None and run is not self.editing_run:
-            x0, y0 = self.pdf_to_canvas(run.bbox[0], run.bbox[1])
-            x1, y1 = self.pdf_to_canvas(run.bbox[2], run.bbox[3])
-            self.canvas.create_rectangle(x0 - 2, y0 - 1, x1 + 2, y1 + 1,
-                                         outline=HOVER_OUTLINE, dash=HOVER_DASH,
-                                         tags=("hover",))
+        if self.tool == TOOL_ADD:
+            return
+        if item is None:
+            self.canvas.configure(cursor="crosshair" if self.tool == TOOL_ERASE else "")
+            return
+        if self.tool == TOOL_EDIT:
+            self.canvas.configure(cursor="xterm")
+            if item is not self.editing_run:
+                self.canvas.create_rectangle(
+                    *self._canvas_box(item.bbox, 2), outline=HOVER_OUTLINE,
+                    dash=HOVER_DASH, tags=("hover",))
+        else:
+            self.canvas.configure(cursor="crosshair")
+            self.canvas.create_rectangle(
+                *self._canvas_box(item.bbox, 1), outline=ERASE_COLOR,
+                width=1.5, tags=("hover",))
 
-    # -- Clicking -------------------------------------------------------------
+    # -- Mouse buttons ----------------------------------------------------------
 
     def _on_click(self, event) -> None:
         if not self.model.doc:
             return
-        run = self.run_at_canvas(*self.event_coords(event))
-        if run is not None:
-            self.on_click_run(run, self.event_coords(event))
+        xy = self.event_coords(event)
+        if self.tool == TOOL_EDIT:
+            run = self.run_at_canvas(*xy)
+            if run is not None:
+                self.on_click_run(run, xy)
+            else:
+                self.on_click_blank()
+        elif self.tool == TOOL_ADD:
+            self.on_add_click(self.canvas_to_pdf(*xy))
         else:
-            self.on_click_blank()
+            self._begin_erase_drag(xy)
 
-    # -- Inline editor --------------------------------------------------------
+    def _on_drag(self, event) -> None:
+        if self.tool == TOOL_ERASE and self._drag_start is not None:
+            self._update_erase_drag(self.event_coords(event))
 
-    def begin_inline_edit(self, run: TextRun, on_commit, on_cancel,
-                          click_canvas_x: Optional[float] = None) -> tk.Entry:
-        """Put a text box over ``run``, prefilled with its text."""
+    def _on_release(self, event) -> None:
+        if self.tool == TOOL_ERASE and self._drag_start is not None:
+            self._finish_erase_drag(self.event_coords(event))
+
+    # -- Erase selection ------------------------------------------------------
+
+    def _reset_drag(self) -> None:
+        self._anchor_word = None
+        self._drag_start = None
+        self.selection = []
+        self.canvas.delete("erase_sel")
+
+    def _begin_erase_drag(self, xy) -> None:
+        self._reset_drag()
+        self._drag_start = xy
+        self._anchor_word = self.word_at_canvas(*xy)
+        if self._anchor_word is not None:
+            self.selection = [self._anchor_word]
+        self._draw_selection(xy)
+
+    def _update_erase_drag(self, xy) -> None:
+        if self._anchor_word is not None:
+            word = self.word_at_canvas(*xy)
+            if word is not None:
+                self.selection = words_between(self._words, self._anchor_word, word)
+        self._draw_selection(xy)
+
+    def _marquee(self, xy) -> Optional[Tuple[float, float, float, float]]:
+        x0, y0 = self._drag_start
+        x1, y1 = xy
+        if abs(x1 - x0) < MIN_MARQUEE or abs(y1 - y0) < MIN_MARQUEE:
+            return None
+        return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
+
+    def _draw_selection(self, xy) -> None:
+        self.canvas.delete("erase_sel")
+        if self._anchor_word is not None:
+            for word in self.selection:
+                self.canvas.create_rectangle(
+                    *self._canvas_box(word.bbox, 1), fill=ERASE_COLOR,
+                    stipple="gray50", outline="", tags=("erase_sel",))
+        else:
+            box = self._marquee(xy)
+            if box is not None:
+                self.canvas.create_rectangle(
+                    *box, outline=ERASE_COLOR, dash=(4, 3), width=1.5,
+                    fill=ERASE_COLOR, stipple="gray25", tags=("erase_sel",))
+
+    def _finish_erase_drag(self, xy) -> None:
+        words = list(self.selection)
+        box = None if self._anchor_word is not None else self._marquee(xy)
+        self._reset_drag()
+        if words:
+            self.on_erase(words, None)
+        elif box is not None:
+            x0, y0 = self.canvas_to_pdf(box[0], box[1])
+            x1, y1 = self.canvas_to_pdf(box[2], box[3])
+            self.on_erase([], pymupdf.Rect(x0, y0, x1, y1))
+
+    # -- Inline text box ------------------------------------------------------
+
+    def _open_entry(self, x: float, y: float, width: float, height: float,
+                    font, fg: str, text: str, cursor_index, on_commit,
+                    on_cancel) -> tk.Entry:
         self.cancel_inline_edit()
         self.canvas.delete("hover")
-        self.editing_run = run
-        scale = self.mapper.total_scale
-        x0, y0 = self.pdf_to_canvas(run.bbox[0], run.bbox[1])
-        x1, y1 = self.pdf_to_canvas(run.bbox[2], run.bbox[3])
-
-        family = ("Courier" if run.monospaced
-                  else "Times" if run.serif else "Helvetica")
-        style = " ".join(s for s, on in (("bold", run.bold),
-                                         ("italic", run.italic)) if on)
-        font = (family, -max(8, round(run.size * scale)), style or "normal")
-        red, green, blue = (round(c * 255) for c in run.color)
-
         entry = tk.Entry(self.canvas, font=font, relief="solid", bd=1,
-                         bg=EDIT_BACKGROUND, fg=f"#{red:02x}{green:02x}{blue:02x}",
-                         highlightthickness=1, highlightcolor=EDIT_BORDER,
-                         insertbackground="black")
-        entry.insert(0, run.text)
-        if click_canvas_x is not None and x1 > x0:
-            fraction = (click_canvas_x - x0) / (x1 - x0)
-            entry.icursor(round(max(0.0, min(1.0, fraction)) * len(run.text)))
-        else:
-            entry.icursor("end")
-        width = max(x1 - x0 + EDITOR_EXTRA_WIDTH, MIN_EDITOR_WIDTH)
-        height = max(y1 - y0 + 8, 18)
-        self._entry_window = self.canvas.create_window(
-            x0 - 3, y0 - 4, anchor="nw", window=entry, width=width,
-            height=height, tags=("editor",))
+                         bg=EDIT_BACKGROUND, fg=fg, highlightthickness=1,
+                         highlightcolor=EDIT_BORDER, insertbackground="black")
+        entry.insert(0, text)
+        entry.icursor(cursor_index)
+        self.canvas.create_window(x, y, anchor="nw", window=entry, width=width,
+                                  height=height, tags=("editor",))
         self._on_commit, self._on_cancel = on_commit, on_cancel
         entry.bind("<Return>", self._entry_commit)
         entry.bind("<KP_Enter>", self._entry_commit)
@@ -295,6 +454,44 @@ class EditCanvas(PageView):
         entry.focus_set()
         self.entry = entry
         return entry
+
+    def begin_inline_edit(self, run: TextRun, on_commit, on_cancel,
+                          click_canvas_x: Optional[float] = None) -> tk.Entry:
+        """Put a text box over ``run``, prefilled with its text."""
+        x0, y0, x1, y1 = self._canvas_box(run.bbox)
+        family = ("Courier" if run.monospaced
+                  else "Times" if run.serif else "Helvetica")
+        font = _tk_font(family, run.size * self.mapper.total_scale,
+                        run.bold, run.italic)
+        if click_canvas_x is not None and x1 > x0:
+            fraction = max(0.0, min(1.0, (click_canvas_x - x0) / (x1 - x0)))
+            cursor = round(fraction * len(run.text))
+        else:
+            cursor = "end"
+        entry = self._open_entry(
+            x0 - 3, y0 - 4, max(x1 - x0 + EDITOR_EXTRA_WIDTH, MIN_EDITOR_WIDTH),
+            max(y1 - y0 + 8, 18), font, _hex(run.color), run.text, cursor,
+            on_commit, on_cancel)
+        self.editing_run = run
+        return entry
+
+    def begin_add_text(self, pdf_xy: Tuple[float, float], style: TextStyle,
+                       on_commit, on_cancel) -> tk.Entry:
+        """Put an empty text box with its top-left corner at ``pdf_xy``."""
+        cx, cy = self.pdf_to_canvas(*pdf_xy)
+        size_px = style.size * self.mapper.total_scale
+        return self._open_entry(
+            cx - 3, cy - 3, MIN_EDITOR_WIDTH + 80, max(size_px * 1.4 + 6, 18),
+            _tk_font(style.family, size_px, style.bold, style.italic),
+            _hex(style.color), "", "end", on_commit, on_cancel)
+
+    def restyle_entry(self, style: TextStyle) -> None:
+        """Update an open add-text box to show the new style."""
+        if self.entry is not None and self.editing_run is None:
+            self.entry.configure(
+                font=_tk_font(style.family, style.size * self.mapper.total_scale,
+                              style.bold, style.italic),
+                fg=_hex(style.color))
 
     def _entry_commit(self, event=None) -> str:
         self._on_commit()
@@ -306,14 +503,13 @@ class EditCanvas(PageView):
 
     def end_inline_edit(self) -> Optional[str]:
         """Remove the text box. Returns what was typed (None if there was
-        no edit in progress)."""
+        no text box open)."""
         if self.entry is None:
             return None
         text = self.entry.get()
         self.canvas.delete("editor")
         self.entry.destroy()
         self.entry = None
-        self._entry_window = None
         self.editing_run = None
         return text
 
@@ -336,6 +532,14 @@ class EditorApp:
 
         self.model = EditorModel()
         self.renderer = PDFRenderer()
+        self.tool_var = tk.StringVar(value=TOOL_EDIT)
+        self.fill_var = tk.StringVar(value=FILL_CONTENT)
+        self.family_var = tk.StringVar(value="Helvetica")
+        self.size_var = tk.StringVar(value="12")
+        self.bold_var = tk.BooleanVar(value=False)
+        self.italic_var = tk.BooleanVar(value=False)
+        self.text_color: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._adding_at: Optional[Tuple[int, Tuple[float, float]]] = None
 
         self._build_menu()
         self._build_toolbar()
@@ -344,7 +548,9 @@ class EditorApp:
 
         self.view = EditCanvas(self.canvas, self.model, self.renderer,
                                on_click_run=self._on_click_run,
-                               on_click_blank=self._on_click_blank)
+                               on_click_blank=self._on_click_blank,
+                               on_add_click=self._on_add_click,
+                               on_erase=self._on_erase)
 
         self._resize_job = None
         self.canvas.bind("<Configure>", self._on_canvas_configure)
@@ -357,11 +563,15 @@ class EditorApp:
         self.root.bind("<Command-z>", lambda e: self._on_undo())
         self.root.bind("<Command-Shift-z>", lambda e: self._on_redo())
         self.root.bind("<Command-Shift-Z>", lambda e: self._on_redo())
+        for number, tool in enumerate(TOOLS, start=1):
+            self.root.bind(f"<Command-Key-{number}>",
+                           lambda e, t=tool: self.set_tool(t))
         self.root.protocol("WM_DELETE_WINDOW", self._on_quit)
         # Finder "Open With" / double-clicking a PDF delivers files through
         # this Apple Event hook rather than argv.
         self.root.createcommand("::tk::mac::OpenDocument", self._on_open_documents)
 
+        self._show_tool_panel()
         self._update_ui_state()
 
     def _on_open_documents(self, *paths) -> None:
@@ -395,6 +605,15 @@ class EditorApp:
         self.edit_menu.add_command(label="Redo", command=self._on_redo,
                                    accelerator="Cmd+Shift+Z")
 
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+        for number, (tool, label) in enumerate(
+                ((TOOL_EDIT, "Edit Text"), (TOOL_ADD, "Add Text"),
+                 (TOOL_ERASE, "Erase")), start=1):
+            tools_menu.add_radiobutton(label=label, variable=self.tool_var,
+                                       value=tool, accelerator=f"Cmd+{number}",
+                                       command=lambda t=tool: self.set_tool(t))
+
     def _build_toolbar(self) -> None:
         toolbar = ttk.Frame(self.root, padding=(5, 3))
         toolbar.pack(side="top", fill="x")
@@ -407,6 +626,17 @@ class EditorApp:
 
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y",
                                                        padx=5, pady=2)
+        self.tool_buttons = {}
+        for tool, label in ((TOOL_EDIT, "✎ Edit Text"), (TOOL_ADD, "+ Add Text"),
+                            (TOOL_ERASE, "⌫ Erase")):
+            button = ttk.Radiobutton(toolbar, text=label, value=tool,
+                                     variable=self.tool_var, style="Toolbutton",
+                                     command=lambda t=tool: self.set_tool(t))
+            button.pack(side="left", padx=1)
+            self.tool_buttons[tool] = button
+
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y",
+                                                       padx=8, pady=2)
         self.prev_btn = ttk.Button(toolbar, text="◀", command=self._prev_page,
                                    width=3)
         self.prev_btn.pack(side="left", padx=(0, 3))
@@ -447,19 +677,13 @@ class EditorApp:
         sidebar = ttk.Frame(main, width=SIDEBAR_WIDTH)
         main.add(sidebar, weight=0)
 
-        help_frame = ttk.LabelFrame(sidebar, text="Editing", padding=8)
-        help_frame.pack(fill="x", padx=5, pady=(5, 3))
-        ttk.Label(help_frame,
-                  text="Click any text to edit it. Press Return to apply "
-                       "or Esc to cancel. Clearing the text deletes it.",
-                  wraplength=240, justify="left").pack(fill="x")
-
-        info_frame = ttk.LabelFrame(sidebar, text="Selected Text", padding=8)
-        info_frame.pack(fill="x", padx=5, pady=3)
-        self.info_label = ttk.Label(info_frame, text="Nothing selected",
-                                    foreground="gray", wraplength=240,
-                                    justify="left")
-        self.info_label.pack(fill="x")
+        # One panel per tool; only the current tool's is shown.
+        self.tool_panels = {}
+        self.tool_panel_holder = ttk.Frame(sidebar)
+        self.tool_panel_holder.pack(fill="x")
+        self.tool_panels[TOOL_EDIT] = self._build_edit_panel(self.tool_panel_holder)
+        self.tool_panels[TOOL_ADD] = self._build_add_panel(self.tool_panel_holder)
+        self.tool_panels[TOOL_ERASE] = self._build_erase_panel(self.tool_panel_holder)
 
         history_frame = ttk.LabelFrame(sidebar, text="History", padding=8)
         history_frame.pack(fill="both", expand=True, padx=5, pady=3)
@@ -483,12 +707,132 @@ class EditorApp:
                                    width=8)
         self.redo_btn.pack(side="left")
 
+    def _build_edit_panel(self, parent) -> ttk.Frame:
+        panel = ttk.Frame(parent)
+        help_frame = ttk.LabelFrame(panel, text="Edit Text", padding=8)
+        help_frame.pack(fill="x", padx=5, pady=(5, 3))
+        ttk.Label(help_frame,
+                  text="Click any text to edit it. Press Return to apply "
+                       "or Esc to cancel. Clearing the text deletes it.",
+                  wraplength=240, justify="left").pack(fill="x")
+        info_frame = ttk.LabelFrame(panel, text="Selected Text", padding=8)
+        info_frame.pack(fill="x", padx=5, pady=3)
+        self.info_label = ttk.Label(info_frame, text="Nothing selected",
+                                    foreground="gray", wraplength=240,
+                                    justify="left")
+        self.info_label.pack(fill="x")
+        return panel
+
+    def _build_add_panel(self, parent) -> ttk.Frame:
+        panel = ttk.Frame(parent)
+        frame = ttk.LabelFrame(panel, text="Add Text", padding=8)
+        frame.pack(fill="x", padx=5, pady=(5, 3))
+        ttk.Label(frame, text="Click anywhere on the page and type. Press "
+                              "Return to add it or Esc to cancel.",
+                  wraplength=240, justify="left").pack(fill="x", pady=(0, 6))
+
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text="Font").pack(side="left")
+        self.family_box = ttk.Combobox(row, textvariable=self.family_var,
+                                       values=list(FAMILIES), state="readonly",
+                                       width=11)
+        self.family_box.pack(side="left", padx=(6, 6))
+        ttk.Label(row, text="Size").pack(side="left")
+        self.size_box = ttk.Spinbox(row, textvariable=self.size_var,
+                                    from_=MIN_SIZE, to=MAX_SIZE, increment=1,
+                                    width=4)
+        self.size_box.pack(side="left", padx=(6, 0))
+
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=2)
+        ttk.Checkbutton(row, text="Bold", variable=self.bold_var).pack(side="left")
+        ttk.Checkbutton(row, text="Italic", variable=self.italic_var).pack(
+            side="left", padx=(8, 8))
+        self.color_swatch = tk.Label(row, width=2, bg=_hex(self.text_color),
+                                     relief="solid", bd=1)
+        self.color_swatch.pack(side="left")
+        ttk.Button(row, text="Colour…", command=self._choose_color,
+                   width=8).pack(side="left", padx=(4, 0))
+
+        for var in (self.family_var, self.size_var, self.bold_var, self.italic_var):
+            var.trace_add("write", lambda *a: self._on_style_change())
+        return panel
+
+    def _build_erase_panel(self, parent) -> ttk.Frame:
+        panel = ttk.Frame(parent)
+        frame = ttk.LabelFrame(panel, text="Erase", padding=8)
+        frame.pack(fill="x", padx=5, pady=(5, 3))
+        ttk.Label(frame,
+                  text="Click a word to erase it. Drag across words to erase "
+                       "a phrase or sentence, or drag from empty space to "
+                       "erase everything in a rectangle.",
+                  wraplength=240, justify="left").pack(fill="x", pady=(0, 6))
+        ttk.Label(frame, text="Fill what's left behind with:").pack(anchor="w")
+        ttk.Radiobutton(frame, text="Content-aware fill", value=FILL_CONTENT,
+                        variable=self.fill_var).pack(anchor="w")
+        ttk.Radiobutton(frame, text="Background colour", value=FILL_COLOR,
+                        variable=self.fill_var).pack(anchor="w")
+        ttk.Label(frame,
+                  text="Real text just disappears, showing what's behind it. "
+                       "The fill is used for scanned or image content and "
+                       "for shapes in an erased rectangle.",
+                  foreground="gray", wraplength=240, justify="left",
+                  font=("TkDefaultFont", 10)).pack(fill="x", pady=(4, 0))
+        return panel
+
     def _build_status_bar(self) -> None:
         status_frame = ttk.Frame(self.root, relief="sunken", padding=(5, 2))
         status_frame.pack(side="bottom", fill="x")
         self.status_label = ttk.Label(status_frame,
                                       text="Ready — open a PDF to begin")
         self.status_label.pack(side="left")
+
+    # -- Tools ----------------------------------------------------------------
+
+    def set_tool(self, tool: str) -> None:
+        if self.view.entry is not None and not self._commit_inline_edit():
+            self.tool_var.set(self.view.tool)  # stay put; the box is still open
+            return
+        self.tool_var.set(tool)
+        self.view.set_tool(tool)
+        self._show_tool_panel()
+        self._set_status({TOOL_EDIT: "Edit Text — click any text to edit it",
+                          TOOL_ADD: "Add Text — click where the new text goes",
+                          TOOL_ERASE: "Erase — click a word, or drag to select"}[tool])
+
+    def _show_tool_panel(self) -> None:
+        for tool, panel in self.tool_panels.items():
+            if tool == self.tool_var.get():
+                panel.pack(fill="x")
+            else:
+                panel.pack_forget()
+
+    def current_style(self) -> TextStyle:
+        try:
+            size = float(self.size_var.get())
+        except ValueError:
+            size = 12.0
+        return TextStyle(family=self.family_var.get(), size=size,
+                         bold=self.bold_var.get(), italic=self.italic_var.get(),
+                         color=self.text_color)
+
+    def _on_style_change(self) -> None:
+        if self._adding_at is not None:
+            try:
+                self.view.restyle_entry(self.current_style())
+            except (tk.TclError, KeyError):
+                pass
+
+    def _choose_color(self) -> None:
+        _rgb, hex_color = colorchooser.askcolor(color=_hex(self.text_color),
+                                                title="Text Colour")
+        if not hex_color:
+            return
+        hex_color = hex_color.lstrip("#")
+        self.text_color = tuple(int(hex_color[i:i + 2], 16) / 255 for i in (0, 2, 4))
+        self.color_swatch.configure(bg=_hex(self.text_color))
+        self._on_style_change()
 
     # -- UI state -------------------------------------------------------------
 
@@ -523,14 +867,26 @@ class EditorApp:
         self.view.display_page(self.model.current_page)
         self._update_ui_state()
 
+    def _after_change(self, label: Optional[str], page_num: int) -> None:
+        self.renderer.invalidate(page_num)
+        self._refresh_page()
+        self._update_history_list()
+        self._set_status(label or "No change")
+
+    def _after_failure(self, exc: Exception, title: str) -> None:
+        self.renderer.invalidate()
+        self._refresh_page()
+        self._update_history_list()
+        messagebox.showerror(title, str(exc))
+
     def _set_status(self, text: str) -> None:
         self.status_label.config(text=text)
 
-    # -- Editing --------------------------------------------------------------
+    # -- Edit tool ------------------------------------------------------------
 
     def _on_click_run(self, run: TextRun, canvas_xy) -> None:
         if self.view.entry is not None:
-            if run.same_as(self.view.editing_run):
+            if self.view.editing_run is not None and run.same_as(self.view.editing_run):
                 return  # clicking inside the text being edited
             # Committing re-renders the page (possibly at a new scale), so
             # remember the click in PDF points, not screen pixels.
@@ -558,14 +914,18 @@ class EditorApp:
 
     def _cancel_inline_edit(self) -> None:
         self.view.cancel_inline_edit()
-        self._set_status("Edit cancelled")
+        self._adding_at = None
+        self._set_status("Cancelled")
 
     def _commit_inline_edit(self) -> bool:
-        """Apply what's in the inline editor. Returns False if the user
-        backed out at a warning (the editor stays open in that case)."""
-        run = self.view.editing_run
-        if run is None or self.view.entry is None:
+        """Apply what's in the inline text box (an edit or new text).
+        Returns False if the user backed out at a warning or there was an
+        error; the box stays open in that case."""
+        if self.view.entry is None:
             return True
+        if self._adding_at is not None:
+            return self._commit_add_text()
+        run = self.view.editing_run
         new_text = self.view.entry.get()
         plan = self.model.plan_edit(run, new_text)
         if plan.is_noop:
@@ -574,42 +934,91 @@ class EditorApp:
             return True
         if not plan.can_apply:
             messagebox.showerror("Can't Make This Edit", "\n\n".join(plan.errors))
-            if self.view.entry is not None:
-                self.view.entry.focus_set()
+            self._refocus_entry()
             return False
         if plan.warnings and not messagebox.askokcancel(
                 "Edit Text", "\n\n".join(plan.warnings)
                 + "\n\nApply the edit anyway?", icon="warning"):
-            if self.view.entry is not None:
-                self.view.entry.focus_set()
+            self._refocus_entry()
             return False
 
         self.view.end_inline_edit()
         try:
             label = self.model.apply_plan(plan)
         except EditError as exc:
-            self.renderer.invalidate()
-            self._refresh_page()
-            self._update_history_list()
-            messagebox.showerror("Edit Failed", str(exc))
+            self._after_failure(exc, "Edit Failed")
             return True
-        self.renderer.invalidate(run.page_num)
-        self._refresh_page()
-        self._update_history_list()
-        self._set_status(label or "No change")
+        self._after_change(label, run.page_num)
         return True
+
+    def _refocus_entry(self) -> None:
+        if self.view.entry is not None:
+            self.view.entry.focus_set()
+
+    # -- Add Text tool --------------------------------------------------------
+
+    def _on_add_click(self, pdf_xy: Tuple[float, float]) -> None:
+        if self.view.entry is not None:
+            # Committing may re-render the page; pdf_xy stays valid.
+            if not self._commit_inline_edit():
+                return
+        self._adding_at = (self.model.current_page, pdf_xy)
+        self.view.begin_add_text(pdf_xy, self.current_style(),
+                                 on_commit=self._commit_inline_edit,
+                                 on_cancel=self._cancel_inline_edit)
+        self._set_status("Adding text — Return to add, Esc to cancel")
+
+    def _commit_add_text(self) -> bool:
+        page_num, top_left = self._adding_at
+        text = self.view.entry.get()
+        if not text.strip():
+            self.view.end_inline_edit()
+            self._adding_at = None
+            self._set_status("Nothing added")
+            return True
+        plan = self.model.plan_add_text(page_num, top_left, text,
+                                        self.current_style())
+        if plan.errors:
+            # Nothing was changed: let the user fix the text and try again.
+            messagebox.showerror("Can't Add This Text", "\n\n".join(plan.errors))
+            self._refocus_entry()
+            return False
+        self.view.end_inline_edit()
+        self._adding_at = None
+        try:
+            label = self.model.apply_add(plan)
+        except EditError as exc:
+            self._after_failure(exc, "Add Text Failed")
+            return True
+        self._after_change(label, page_num)
+        return True
+
+    # -- Erase tool -----------------------------------------------------------
+
+    def _on_erase(self, words: List[Word], area: Optional[pymupdf.Rect]) -> None:
+        if self.view.entry is not None and not self._commit_inline_edit():
+            return
+        page_num = self.model.current_page
+        plan = ErasePlan(page_num=page_num, words=list(words), area=area,
+                         fill=self.fill_var.get())
+        try:
+            label = self.model.erase(plan)
+        except EditError as exc:
+            self._after_failure(exc, "Can't Erase That")
+            return
+        self._after_change(label, page_num)
 
     # -- File operations ------------------------------------------------------
 
     def _confirm_discard(self) -> bool:
-        """Ask before throwing away unsaved edits. True = go ahead."""
+        """Ask before throwing away unsaved changes. True = go ahead."""
         if self.view.entry is not None:
             self._cancel_inline_edit()
         if not self.model.is_dirty:
             return True
         answer = messagebox.askyesnocancel(
             "Unsaved Changes",
-            "This document has edits that haven't been saved.\n\n"
+            "This document has changes that haven't been saved.\n\n"
             "Save them first?")
         if answer is None:
             return False

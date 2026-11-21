@@ -315,8 +315,7 @@ def test_password_protected_pdf_shows_an_error(app, tmp_path, monkeypatch):
     app.open_path(str(path))
 
     assert shown and "password-protected" in shown[0]
-    # The previously open document is gone from the window too.
-    assert app.root.title() == "PDF Editor"
-    assert app.canvas.find_all() == ()
-    assert app.history_list.size() == 0
-    assert str(app.undo_btn["state"]) == "disabled"
+    # The document that was already open is still open and shown.
+    assert app.model.file_path.endswith("sample.pdf")
+    assert app.root.title().endswith("sample.pdf")
+    assert app.canvas.find_withtag("page_image")

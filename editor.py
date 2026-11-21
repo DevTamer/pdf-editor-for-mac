@@ -57,14 +57,6 @@ def _current_umask() -> int:
     return mask
 
 
-def _is_password_protected(path: str) -> bool:
-    try:
-        with pymupdf.open(path) as doc:
-            return bool(doc.needs_pass)
-    except Exception:
-        return False
-
-
 def _short(text: str, limit: int = 24) -> str:
     text = text.strip()
     return text if len(text) <= limit else text[:limit - 1] + "…"
@@ -90,17 +82,9 @@ class EditorModel(DocumentSession):
     # -- Document lifecycle ---------------------------------------------------
 
     def open_document(self, path: str) -> None:
-        try:
-            super().open_document(path)
-        except Exception:
-            # Don't leave a half-opened document behind (e.g. an encrypted
-            # file that opened but can't be read).
-            self.close_document()
-            if _is_password_protected(path):
-                raise ValueError("This PDF is password-protected. "
-                                 "Password-protected PDFs aren't supported "
-                                 "yet.") from None
-            raise
+        # If this fails (unreadable or password-protected file), pdfcore
+        # leaves the current document, its history and our state untouched.
+        super().open_document(path)
         self._saved_entry = self.history.current
         self.save_path = None
 
@@ -637,12 +621,7 @@ class EditorApp:
         try:
             self.model.open_document(path)
         except Exception as exc:
-            # The model is left with nothing open; make the window match.
-            self.renderer.invalidate()
-            self.canvas.delete("all")
-            self._update_history_list()
-            self.info_label.config(text="Nothing selected", foreground="gray")
-            self._set_status("Ready — open a PDF to begin")
+            # Whatever was open before stays open (see EditorModel).
             messagebox.showerror("Error", f"Could not open PDF:\n{exc}")
             return
         self.renderer.invalidate()

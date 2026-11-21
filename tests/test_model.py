@@ -250,13 +250,16 @@ def test_password_protected_pdf_is_refused_cleanly(tmp_path, sample_pdf_path):
 
     m = EditorModel()
     m.open_document(str(sample_pdf_path))
+    m.apply_plan(m.plan_edit(_run(m, TARGET), "Unsaved work"))
     with pytest.raises(ValueError, match="password-protected"):
         m.open_document(str(path))
 
-    # Nothing half-open left behind.
-    assert m.doc is None
-    assert not m.is_dirty
-    assert m.history_entries() == []
+    # The open document, its history and unsaved edits are untouched.
+    assert m.file_path == str(sample_pdf_path)
+    assert "Unsaved work" in _page_text(m)
+    assert m.is_dirty
+    assert len(m.history_entries()) == 2
+    m.close_document()
 
 
 def test_unreadable_file_is_refused_cleanly(tmp_path):

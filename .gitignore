@@ -1,0 +1,16 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.pdf
+!tests/fixtures/*.pdf
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+
+.build-venv/
+packaging/build/
+packaging/dist/
+packaging/*.dmg

@@ -51,6 +51,20 @@ MIN_EDITOR_WIDTH = 160  # px
 EDITOR_EXTRA_WIDTH = 60  # px of room to type beyond the original text
 
 
+def _current_umask() -> int:
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+def _is_password_protected(path: str) -> bool:
+    try:
+        with pymupdf.open(path) as doc:
+            return bool(doc.needs_pass)
+    except Exception:
+        return False
+
+
 def _short(text: str, limit: int = 24) -> str:
     text = text.strip()
     return text if len(text) <= limit else text[:limit - 1] + "…"
@@ -76,7 +90,17 @@ class EditorModel(DocumentSession):
     # -- Document lifecycle ---------------------------------------------------
 
     def open_document(self, path: str) -> None:
-        super().open_document(path)
+        try:
+            super().open_document(path)
+        except Exception:
+            # Don't leave a half-opened document behind (e.g. an encrypted
+            # file that opened but can't be read).
+            self.close_document()
+            if _is_password_protected(path):
+                raise ValueError("This PDF is password-protected. "
+                                 "Password-protected PDFs aren't supported "
+                                 "yet.") from None
+            raise
         self._saved_entry = self.history.current
         self.save_path = None
 
@@ -154,10 +178,17 @@ class EditorModel(DocumentSession):
         """
         copy = pymupdf.open(stream=self.doc.tobytes(), filetype="pdf")
         directory = os.path.dirname(os.path.abspath(path))
+        # Keep an existing file's permissions; give a new file the usual
+        # ones (mkstemp creates its temp file readable by the owner only).
+        if os.path.exists(path):
+            mode = os.stat(path).st_mode & 0o777
+        else:
+            mode = 0o666 & ~_current_umask()
         fd, tmp_path = tempfile.mkstemp(suffix=".pdf", dir=directory)
         os.close(fd)
         try:
             copy.save(tmp_path, garbage=3, deflate=True)
+            os.chmod(tmp_path, mode)
             os.replace(tmp_path, path)
         except Exception:
             if os.path.exists(tmp_path):
@@ -606,6 +637,12 @@ class EditorApp:
         try:
             self.model.open_document(path)
         except Exception as exc:
+            # The model is left with nothing open; make the window match.
+            self.renderer.invalidate()
+            self.canvas.delete("all")
+            self._update_history_list()
+            self.info_label.config(text="Nothing selected", foreground="gray")
+            self._set_status("Ready — open a PDF to begin")
             messagebox.showerror("Error", f"Could not open PDF:\n{exc}")
             return
         self.renderer.invalidate()
@@ -723,9 +760,10 @@ class EditorApp:
         if not self.model.doc:
             return
         if self.view.entry is not None:
-            # Cmd+Z while typing cancels the edit rather than undoing the
-            # document underneath it.
+            # Cmd+Z (or a History click) while typing cancels the typing
+            # rather than changing the document underneath it.
             self._cancel_inline_edit()
+            self._update_history_list()  # undo any History selection
             return
         label = move()
         self.renderer.invalidate()

@@ -284,3 +284,39 @@ def test_save_as_writes_file_and_clears_dirty(app, tmp_path, monkeypatch):
 def test_open_documents_apple_event(app, sample_pdf_path):
     app._on_open_documents(str(sample_pdf_path), "/tmp/not-a-pdf.txt")
     assert app.model.file_path == str(sample_pdf_path)
+
+
+def test_history_click_while_typing_only_cancels_typing(app):
+    _click(app, TARGET)
+    _type(app, "Edited")
+    app._commit_inline_edit()
+    _click(app, "Edited")
+
+    app.history_list.selection_clear(0, "end")
+    app.history_list.selection_set(0)       # click "Original"
+    app._on_history_select()
+
+    assert app.view.entry is None
+    assert "Edited" in _page_text(app)      # didn't jump
+    assert app.history_list.curselection() == (1,)  # selection reset
+
+
+def test_password_protected_pdf_shows_an_error(app, tmp_path, monkeypatch):
+    path = tmp_path / "locked.pdf"
+    doc = pymupdf.open()
+    doc.new_page()
+    doc.save(str(path), encryption=pymupdf.PDF_ENCRYPT_AES_256,
+             user_pw="pw", owner_pw="pw")
+    doc.close()
+    shown = []
+    monkeypatch.setattr(editor.messagebox, "showerror",
+                        lambda title, message: shown.append(message))
+
+    app.open_path(str(path))
+
+    assert shown and "password-protected" in shown[0]
+    # The previously open document is gone from the window too.
+    assert app.root.title() == "PDF Editor"
+    assert app.canvas.find_all() == ()
+    assert app.history_list.size() == 0
+    assert str(app.undo_btn["state"]) == "disabled"

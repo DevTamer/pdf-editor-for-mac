@@ -2,6 +2,7 @@
 unsaved-changes tracking, and saving."""
 
 import os
+import stat
 
 import pymupdf
 import pytest
@@ -237,3 +238,47 @@ def test_dirty_tracking_follows_the_saved_state(model, tmp_path):
 def test_describe_font(model):
     assert model.describe_font(_run(model, TITLE)) == "NimbusRoman-Regular (embedded)"
     assert model.describe_font(_run(model, TARGET)) == "Helvetica (standard PDF font)"
+
+
+def test_password_protected_pdf_is_refused_cleanly(tmp_path, sample_pdf_path):
+    path = tmp_path / "locked.pdf"
+    doc = pymupdf.open()
+    doc.new_page().insert_text((50, 100), "secret", fontname="helv")
+    doc.save(str(path), encryption=pymupdf.PDF_ENCRYPT_AES_256,
+             user_pw="pw", owner_pw="pw")
+    doc.close()
+
+    m = EditorModel()
+    m.open_document(str(sample_pdf_path))
+    with pytest.raises(ValueError, match="password-protected"):
+        m.open_document(str(path))
+
+    # Nothing half-open left behind.
+    assert m.doc is None
+    assert not m.is_dirty
+    assert m.history_entries() == []
+
+
+def test_unreadable_file_is_refused_cleanly(tmp_path):
+    path = tmp_path / "junk.pdf"
+    path.write_bytes(b"this is not a pdf")
+    m = EditorModel()
+    with pytest.raises(Exception):
+        m.open_document(str(path))
+    assert m.doc is None and not m.is_dirty
+
+
+def test_new_saved_file_gets_normal_permissions(model, tmp_path):
+    out = tmp_path / "new.pdf"
+    model.save_document(str(out))
+    umask = os.umask(0)
+    os.umask(umask)
+    assert stat.S_IMODE(out.stat().st_mode) == 0o666 & ~umask
+
+
+def test_overwriting_keeps_the_file_permissions(model, tmp_path):
+    out = tmp_path / "existing.pdf"
+    out.write_bytes(b"old")
+    os.chmod(out, 0o640)
+    model.save_document(str(out))
+    assert stat.S_IMODE(out.stat().st_mode) == 0o640

@@ -13,8 +13,11 @@ What erasing does
    removing it reveals the actual background, which is the best fill there is.
 2. **Images** under the erased area are filled *in the image's own pixels*:
    the scan or photo is decoded, the area is filled from its surroundings,
-   and the image is rewritten in place, stored the way it was (a JPEG scan
-   stays a same-size JPEG), so anything drawn on top of it stays on top.
+   and the image is rewritten in place, in its own colour space and stored
+   compactly (a JPEG scan stays a same-size JPEG), so anything drawn on top
+   of it stays on top. Images that can't safely be edited in place (shown
+   elsewhere too, transparent, or in an unsupported colour space) get a
+   patch over them instead.
    This is what erases words in scanned pages. Their visible letters are
    pixels, usually with an invisible OCR text layer on top, and that layer
    is removed too.
@@ -38,8 +41,9 @@ graphics are covered, never deleted.
 from __future__ import annotations
 
 import io
+import re
 import zlib
-from collections import Counter
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -47,7 +51,10 @@ import pymupdf
 from PIL import Image, ImageChops, ImageFilter, ImageStat, JpegImagePlugin
 
 from textedit import (
-    BAND_BOTTOM, BAND_INSET, BAND_TOP, EditError, _char_counts, _counted,
+    ANNOTATION_TEXT_ERROR, BAND_BOTTOM, BAND_INSET, BAND_TOP,
+    PENDING_REDACTIONS_ERROR, EditError, _char_counts, _counted,
+    annotation_boxes, annotation_inventory, check_annotations_kept,
+    has_pending_redactions,
 )
 
 FILL_CONTENT = "content"
@@ -366,6 +373,7 @@ def _remove_chars(page: pymupdf.Page, chars: Sequence[Char]) -> None:
             stretches[-1].append(c)
         else:
             stretches.append([c])
+    annotations = annotation_inventory(page)
     for run in stretches:
         oy, size = run[0].origin[1], run[0].size
         page.add_redact_annot(
@@ -374,30 +382,107 @@ def _remove_chars(page: pymupdf.Page, chars: Sequence[Char]) -> None:
             fill=False)
     page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
                           graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
+    check_annotations_kept(page, annotations)
     if _char_counts(page) != expected:
         raise EditError("Erasing would also have removed text outside the "
                         "selection, so nothing was erased.")
 
 
-def _image_use_counts(doc: pymupdf.Document) -> Counter:
-    counts: Counter = Counter()
-    for page in doc:
-        for info in page.get_image_info(xrefs=True):
-            if info["xref"]:
-                counts[info["xref"]] += 1
-    return counts
+_REFERENCE = re.compile(rb"(?<![0-9])(\d+) 0 R")
 
 
-def _editable_image(doc, info, use_counts) -> bool:
+def _referrers(doc: pymupdf.Document) -> Dict[int, List[int]]:
+    """For every object number, the *live* objects whose dictionaries refer
+    to it (pages, resource dictionaries, forms, annotation appearances...).
+
+    Only objects reachable from the document catalog count: edits leave
+    orphaned objects behind (e.g. a page's old resource dictionary after
+    its content is rewritten) that still "refer" to things until the file
+    is garbage-collected on save.
+    """
+    def refs(xref):
+        try:
+            source = doc.xref_object(xref, compressed=True)
+        except Exception:
+            return []
+        return [int(m.group(1)) for m in
+                _REFERENCE.finditer(source.encode("latin-1", "replace"))]
+
+    who: Dict[int, List[int]] = defaultdict(list)
+    root = doc.pdf_catalog()
+    seen = {root}
+    queue = [root]
+    while queue:
+        xref = queue.pop()
+        for target in refs(xref):
+            who[target].append(xref)
+            if target not in seen and 0 < target < doc.xref_length():
+                seen.add(target)
+                queue.append(target)
+    return who
+
+
+def _shown_only_here(page: pymupdf.Page, xref: int,
+                     who: Dict[int, List[int]]) -> bool:
+    """Whether image ``xref`` is reachable only from this page, through a
+    single chain of objects (its resources, a form XObject, ...). Anything
+    else (another page, an annotation's appearance, a resource dictionary
+    shared between pages) means editing it would change other places too."""
+    current = xref
+    for _ in range(8):
+        holders = who.get(current, [])
+        if len(holders) != 1:
+            return False
+        if holders[0] == page.xref:
+            return True
+        current = holders[0]
+    return False
+
+
+def _editable_image(doc, page, info, who, placements) -> bool:
     xref = info["xref"]
-    if not xref or use_counts[xref] != 1:
-        return False                      # inline, or shown more than once
+    if not xref or placements[xref] != 1:
+        return False                      # inline, or drawn twice on this page
+    if not _shown_only_here(page, xref, who):
+        return False                      # also shown elsewhere
     if (doc.xref_get_key(xref, "SMask")[0] != "null"
-            or doc.xref_get_key(xref, "Mask")[0] != "null"):
+            or doc.xref_get_key(xref, "Mask")[0] != "null"
+            or doc.xref_get_key(xref, "SMaskInData")[1] not in ("null", "0")):
         return False                      # has transparency / colour-key mask
     if doc.xref_get_key(xref, "ImageMask")[1] == "true":
         return False                      # stencil mask
     return True
+
+
+# Sentinel: write the samples back in the image's own colour space.
+KEEP_COLORSPACE = ""
+
+
+def _working_pixmap(doc: pymupdf.Document, xref: int):
+    """(pixmap, colour space to write back) for editing an image, or
+    (None, None) if its colour space isn't safe to edit.
+
+    MuPDF hands back samples in the image's *own* colour space (an ICC
+    profile, a spot colour's tint, Lab, ...). Those are edited as they are
+    and written back under the original colour space entry, because tagging
+    them DeviceRGB/DeviceGray would recolour the whole image. CMYK is
+    converted to RGB. Indexed images come back expanded to their base
+    colour space, which is fine only for a plain device base.
+    """
+    kind, value = doc.xref_get_key(xref, "ColorSpace")
+    pix = pymupdf.Pixmap(doc, xref)
+    if pix.alpha:
+        pix = pymupdf.Pixmap(pix, 0)
+    name = pix.colorspace.name if pix.colorspace else ""
+    if name in ("DeviceGray", "DeviceRGB"):
+        return pix, "/" + name
+    if name == "DeviceCMYK":
+        return pymupdf.Pixmap(pymupdf.csRGB, pix), "/DeviceRGB"
+    if "/Indexed" in (value or ""):
+        return None, None
+    if pix.n in (1, 3) and kind != "null":
+        return pix, KEEP_COLORSPACE
+    return None, None
 
 
 def _fill_in_image(doc: pymupdf.Document, page: pymupdf.Page, info,
@@ -405,12 +490,10 @@ def _fill_in_image(doc: pymupdf.Document, page: pymupdf.Page, info,
     """Fill ``targets`` (page coordinates) inside one placed image's own
     pixels. Returns False if the image couldn't be handled."""
     try:
-        pix = pymupdf.Pixmap(doc, info["xref"])
-        if pix.alpha:
-            pix = pymupdf.Pixmap(pix, 0)
-        if pix.n not in (1, 3):
-            pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+        pix, colorspace = _working_pixmap(doc, info["xref"])
     except Exception:
+        return False
+    if pix is None:
         return False
     mode_name = "L" if pix.n == 1 else "RGB"
     img = Image.frombytes(mode_name, (pix.width, pix.height), pix.samples)
@@ -432,21 +515,28 @@ def _fill_in_image(doc: pymupdf.Document, page: pymupdf.Page, info,
         changed = True
     if not changed:
         return True
-    _write_image(doc, info["xref"], img)
+    _write_image(doc, info["xref"], img, colorspace)
     return True
 
 
 JPEG_QUALITY = 90  # only used if the original JPEG's tables can't be read
 
 
-def _write_image(doc: pymupdf.Document, xref: int, img: Image.Image) -> None:
-    """Replace an image's pixels in place, stored the way the original was
-    so the file doesn't balloon.
+def _write_image(doc: pymupdf.Document, xref: int, img: Image.Image,
+                 colorspace: str = KEEP_COLORSPACE) -> None:
+    """Replace an image's pixels in place, stored compactly.
 
     - JPEG stays JPEG, re-encoded with the original's own quantisation
       tables and chroma subsampling (same quality, same size).
+    - JPEG 2000 becomes JPEG (PDF viewers all read it; deflated samples
+      would be several times larger).
     - 1-bit black-and-white stays 1-bit.
-    - Anything else becomes deflated 8-bit samples.
+    - Anything else (including JBIG2 and CCITT fax scans, which become
+      1-bit) is stored as deflated samples.
+
+    ``colorspace`` is the /ColorSpace to set, or KEEP_COLORSPACE to leave
+    the original entry (the samples are in that space; see
+    _working_pixmap).
 
     The image object keeps its number. (PyMuPDF's Page.replace_image adds
     a second copy of the image that survives garbage collection, which
@@ -466,6 +556,10 @@ def _write_image(doc: pymupdf.Document, xref: int, img: Image.Image) -> None:
             buf = io.BytesIO()
             img.save(buf, "JPEG", quality=JPEG_QUALITY)
         data, filter_name, bpc = buf.getvalue(), "/DCTDecode", "8"
+    elif "JPXDecode" in filters:
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=JPEG_QUALITY)
+        data, filter_name, bpc = buf.getvalue(), "/DCTDecode", "8"
     elif bits == "1" and gray:
         one_bit = img.point(lambda v: 255 if v >= 128 else 0).convert("1")
         data, filter_name, bpc = zlib.compress(one_bit.tobytes()), "/FlateDecode", "1"
@@ -473,10 +567,14 @@ def _write_image(doc: pymupdf.Document, xref: int, img: Image.Image) -> None:
         data, filter_name, bpc = zlib.compress(img.tobytes()), "/FlateDecode", "8"
 
     doc.update_stream(xref, data, compress=False)
-    for key, value in (("Filter", filter_name), ("DecodeParms", "null"),
-                       ("Decode", "null"), ("Width", str(img.width)),
-                       ("Height", str(img.height)), ("BitsPerComponent", bpc),
-                       ("ColorSpace", "/DeviceGray" if gray else "/DeviceRGB")):
+    keys = [("Filter", filter_name), ("DecodeParms", "null"), ("Decode", "null"),
+            ("SMaskInData", "null"), ("Width", str(img.width)),
+            ("Height", str(img.height)), ("BitsPerComponent", bpc)]
+    if colorspace != KEEP_COLORSPACE:
+        keys.append(("ColorSpace", colorspace))
+    elif doc.xref_get_key(xref, "ColorSpace")[0] == "null":
+        keys.append(("ColorSpace", "/DeviceGray" if gray else "/DeviceRGB"))
+    for key, value in keys:
         doc.xref_set_key(xref, key, value)
 
 
@@ -521,6 +619,24 @@ def _patch_area(doc: pymupdf.Document, page: pymupdf.Page, page_num: int,
     return True
 
 
+def _unsupported_text_in(page: pymupdf.Page, area: pymupdf.Rect) -> bool:
+    """Whether non-horizontal text (which page_words skips) has characters
+    centred inside ``area``."""
+    for block in page.get_text("rawdict")["blocks"]:
+        for line in block.get("lines", []):
+            dx, dy = line["dir"]
+            if abs(dx - 1) <= 1e-3 and abs(dy) <= 1e-3:
+                continue
+            for span in line["spans"]:
+                for ch in span["chars"]:
+                    if ch["c"].isspace():
+                        continue
+                    x0, y0, x1, y1 = ch["bbox"]
+                    if pymupdf.Point((x0 + x1) / 2, (y0 + y1) / 2) in area:
+                        return True
+    return False
+
+
 def _padded(rect: pymupdf.Rect, pad: float) -> pymupdf.Rect:
     return rect + (-pad, -pad, pad, pad)
 
@@ -533,6 +649,8 @@ def apply_erase(doc: pymupdf.Document, page_num: int,
     page = doc[page_num]
     if page.rotation:
         raise EditError("Erasing on rotated pages isn't supported yet.")
+    if has_pending_redactions(page):
+        raise EditError(PENDING_REDACTIONS_ERROR)
     words_now = page_words(page)
     present = {(w.text, tuple(round(v, 1) for v in w.bbox)) for w in words_now}
     for w in plan.words:
@@ -543,6 +661,13 @@ def apply_erase(doc: pymupdf.Document, page_num: int,
         raise EditError("Nothing to erase in that area.")
 
     chars = plan.chars(words_now)
+    boxes = annotation_boxes(page)
+    if any(pymupdf.Rect(c.bbox).intersects(box) for c in chars for box in boxes):
+        raise EditError(ANNOTATION_TEXT_ERROR)
+    if plan.area is not None and _unsupported_text_in(page, plan.area):
+        raise EditError("That area contains vertical or rotated text, which "
+                        "can't be erased yet. Make the rectangle smaller to "
+                        "leave it out.")
     # Where scanned pixels need filling: under invisible OCR words, and the
     # whole area for a rectangle erase.
     image_targets: List[pymupdf.Rect] = [
@@ -559,13 +684,19 @@ def apply_erase(doc: pymupdf.Document, page_num: int,
 
     patch_targets: List[pymupdf.Rect] = []
     if image_targets:
-        use_counts = _image_use_counts(doc)
-        for info in page.get_image_info(xrefs=True):
+        infos = page.get_image_info(xrefs=True)
+        placements = defaultdict(int)
+        for info in infos:
+            placements[info["xref"]] += 1
+        who = None
+        for info in infos:
             placed = pymupdf.Rect(info["bbox"])
             hits = [t & placed for t in image_targets if t.intersects(placed)]
             if not hits:
                 continue
-            if _editable_image(doc, info, use_counts) and _fill_in_image(
+            if who is None:
+                who = _referrers(doc)
+            if _editable_image(doc, page, info, who, placements) and _fill_in_image(
                     doc, page, info, hits, plan.fill):
                 done["images"] += 1
             else:

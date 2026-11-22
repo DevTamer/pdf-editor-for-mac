@@ -47,6 +47,18 @@ Use a few real PDFs:
 - [ ] Copy the edited text from the saved file in Preview and paste it
       somewhere: it should be exactly what you typed, with normal spaces.
 
+## Tricky documents
+
+- [ ] A PDF with comments (a Preview "Text" box, a sticky note) and links:
+      editing ordinary text keeps every comment and link. Clicking the
+      comment box's own text gives a clear "can't change" message and
+      nothing changes.
+- [ ] A page cropped in Preview (Tools → Crop): editing and adding text land
+      exactly where expected.
+- [ ] A colour scan, or a PDF from a print shop (spot colours / ICC
+      profiles): erasing part of an image leaves the rest of its colours
+      untouched.
+
 ## Tools
 
 - [ ] The toolbar buttons, the Tools menu and Cmd+1/2/3 all switch tools,

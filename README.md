@@ -49,8 +49,10 @@ save over it.
     grain.
   - **Background colour** paints the surrounding colour.
 
-  The image is stored as before, so a JPEG scan stays a JPEG of the same
-  size.
+  The image keeps its colour space and stays compact. A JPEG scan stays a
+  JPEG of about the same size, and a black-and-white scan stays 1-bit.
+  JPEG 2000 scans become JPEG. Other image types are stored deflated,
+  which can be larger than the original encoding.
 - **Shapes in an erased rectangle** (a logo or stamp drawn as vector
   graphics) are covered with a fill. They're never deleted, so larger
   shapes the rectangle merely sits inside, like a page border, are
@@ -84,9 +86,11 @@ For each edit, the app:
 2. **Writes the new text** at the same baseline, size and colour. It uses
    the PDF's own embedded font for every character that font can actually
    draw, and a matching standard font for the rest.
-3. **Verifies the result.** Every other character on the page must be
-   unchanged, and the new text must read back in order where it was written.
-   If anything doesn't check out, the page is restored from the last undo
+3. **Verifies the result.** The page's characters are counted before and
+   after. Apart from what was replaced, the counts must match exactly (layout
+   whitespace aside). The new text must also read back in order where it was
+   written, and every annotation and form field must still be there. If
+   anything doesn't check out, the page is restored from the last undo
    snapshot and you get an error instead of a damaged document.
 
 Deciding whether a font "can draw" a character takes three checks, because
@@ -107,7 +111,11 @@ The details are in the docstring at the top of [`textedit.py`](textedit.py).
   can run into what follows it on the same line (you're warned first). Added
   text is a single line.
 - **Horizontal text on unrotated pages only.** Rotated pages and vertical
-  text are refused for all three tools.
+  text are refused for all three tools. An erase rectangle that contains
+  vertical text is refused too.
+- **Comments and form fields are off limits.** Text in (or under) a comment
+  box, stamp or form field can't be edited or erased yet. A redaction
+  there would delete the whole annotation, so the change is refused.
 - **Spacing is the font's own.** Justified lines that relied on per-word
   positioning, character spacing or horizontal scaling come back with
   natural spacing.
@@ -118,16 +126,25 @@ The details are in the docstring at the top of [`textedit.py`](textedit.py).
   character missing from a PDF's embedded font, uses Helvetica, Times or
   Courier.
 - **Erasing shapes covers them.** Vector graphics in an erased rectangle are
-  covered with a fill rather than removed from the file. Images shown more
-  than once in the document, or with transparency, are also covered with a
-  fill rather than edited, so their other copies aren't changed.
+  covered with a fill rather than removed from the file. Some images are
+  also covered with a fill rather than edited, and their original pixels
+  stay in the file underneath:
+  - images also shown elsewhere (on another page, or in an annotation),
+    so their other copies don't change,
+  - images with transparency,
+  - images in a colour space the editor doesn't handle (for example an
+    indexed palette over an ICC profile).
 - **Content-aware fill isn't magic.** It's made for backgrounds: paper,
   gradients, noise, flat colour. Erasing across detailed photo content
   leaves a soft smudge.
-- **Erasing is not redaction.** Pixels erased from a scan really are
-  replaced, and erased text is removed. But for removing sensitive content
-  with nothing left behind (metadata, hidden layers and so on), use
+- **Erasing is not redaction.** Erased text is removed. Erased scan pixels
+  are replaced when the scan is edited in place, but not where a fill
+  covers them (see above). For removing sensitive content with nothing left
+  behind (metadata, hidden layers and so on), use
   [PDF Redactor](https://github.com/DevTamer/pdf-redactor-for-mac).
+- **Undo depth depends on file size.** Every undo step keeps a full copy of
+  the document in memory, so you get up to 30 steps, fewer for big files
+  (at least 5).
 - The app is unsigned and not notarized. The first time, open it with
   right-click → **Open** → **Open**.
 

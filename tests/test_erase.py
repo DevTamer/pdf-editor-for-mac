@@ -527,3 +527,215 @@ def test_inverted_one_bit_scan_keeps_its_colours():
 
     assert _pixel(doc[0], 350, 250) == background   # rest of the page unchanged
     assert _pixel(doc[0], 150, 110) == background   # erased spot = background
+
+
+# ---------------------------------------------------------------------------
+# Review regressions
+# ---------------------------------------------------------------------------
+
+def test_erase_refuses_pages_with_pending_redactions(scan_doc):
+    page = scan_doc[0]
+    page.add_redact_annot(pymupdf.Rect(300, 260, 350, 280), fill=(1, 0, 0))
+    with pytest.raises(er.EditError, match="redaction marks"):
+        er.apply_erase(scan_doc, 0, er.ErasePlan(0, words=[_word(scan_doc, "stay")]))
+    assert [a.type[1] for a in scan_doc[0].annots()] == ["Redact"]   # not applied
+
+
+def _freetext_doc():
+    doc = pymupdf.open()
+    page = doc.new_page(width=300, height=300)
+    page.insert_text((20, 40), "Body text", fontname="helv", fontsize=12)
+    page.add_freetext_annot(pymupdf.Rect(100, 100, 250, 130), "APPROVED", fontsize=14)
+    return pymupdf.open(stream=doc.tobytes(), filetype="pdf")
+
+
+def test_erase_refuses_comment_box_text():
+    doc = _freetext_doc()
+    word = _word(doc, "APPROVED")
+    with pytest.raises(er.EditError, match="comment box"):
+        er.apply_erase(doc, 0, er.ErasePlan(0, words=[word]))
+    with pytest.raises(er.EditError, match="comment box"):
+        er.apply_erase(doc, 0, er.ErasePlan(0, area=pymupdf.Rect(90, 90, 260, 140)))
+    assert [a.type[1] for a in doc[0].annots()] == ["FreeText"]
+
+
+def test_erase_detects_a_lost_annotation(monkeypatch):
+    doc = _freetext_doc()
+    monkeypatch.setattr(er, "annotation_boxes", lambda page: [])
+    with pytest.raises(er.EditError, match="comment, stamp or form field"):
+        er.apply_erase(doc, 0, er.ErasePlan(0, words=[_word(doc, "APPROVED")]))
+
+
+def test_rectangle_with_vertical_text_is_refused():
+    doc = pymupdf.open()
+    page = doc.new_page(width=300, height=300)
+    page.insert_text((100, 200), "Vertical", fontname="helv", fontsize=14, rotate=90)
+    page.insert_text((150, 150), "Horiz", fontname="helv", fontsize=14)
+    doc = pymupdf.open(stream=doc.tobytes(), filetype="pdf")
+    with pytest.raises(er.EditError, match="vertical or rotated"):
+        er.apply_erase(doc, 0, er.ErasePlan(0, area=pymupdf.Rect(80, 80, 220, 220)))
+    assert "Vertical" in doc[0].get_text() and "Horiz" in doc[0].get_text()
+
+
+def test_empty_rectangle_is_refused(scan_doc):
+    with pytest.raises(er.EditError, match="Nothing to erase"):
+        er.apply_erase(scan_doc, 0, er.ErasePlan(0, area=pymupdf.Rect(50, 50, 50, 50)))
+
+
+def test_image_shown_in_an_annotation_elsewhere_is_not_edited():
+    """An image drawn on page 1 and inside an annotation's appearance on
+    page 2: editing it in place would change page 2 too."""
+    doc = pymupdf.open()
+    doc.new_page(width=200, height=200)
+    doc.new_page(width=200, height=200)   # (creating it invalidates page objects)
+    p1 = doc[0]
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 32, 32), False)
+    pix.set_rect(pix.irect, (30, 120, 200))
+    pix.set_rect(pymupdf.IRect(5, 5, 11, 11), (255, 0, 0))
+    xref = p1.insert_image(pymupdf.Rect(20, 20, 180, 180), pixmap=pix)
+    p2 = doc[1]
+    annot = p2.add_rect_annot(pymupdf.Rect(20, 20, 180, 180))
+    ap = int(doc.xref_get_key(annot.xref, "AP/N")[1].split()[0])
+    doc.update_stream(ap, b"q 160 0 0 160 0 0 cm /Im1 Do Q")
+    doc.xref_set_key(ap, "Resources", f"<</XObject <</Im1 {xref} 0 R>>>>")
+    doc = pymupdf.open(stream=doc.tobytes(), filetype="pdf")
+    page2_before = doc[1].get_pixmap(dpi=72).samples
+
+    done = er.apply_erase(doc, 0, er.ErasePlan(0, area=pymupdf.Rect(40, 40, 80, 80)))
+
+    assert done["images"] == 0 and done["patches"] == 1
+    assert doc[1].get_pixmap(dpi=72).samples == page2_before
+
+
+# -- Colour spaces ------------------------------------------------------------
+
+ROMM = "/System/Library/ColorSync/Profiles/ROMM RGB.icc"
+W = H = 64
+
+
+def _image_with_colorspace(colorspace, samples, icc=None):
+    """A page with one 64x64 image (160pt square) whose samples are written
+    raw under the given /ColorSpace."""
+    import zlib
+    doc = pymupdf.open()
+    page = doc.new_page(width=200, height=200)
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, W, H), False)
+    pix.set_rect(pix.irect, (255, 255, 255))
+    xref = page.insert_image(pymupdf.Rect(20, 20, 180, 180), pixmap=pix)
+    if icc is not None:
+        icc_xref = doc.get_new_xref()
+        doc.update_object(icc_xref, "<</N 3>>")
+        doc.update_stream(icc_xref, icc)
+        colorspace = colorspace.replace("ICC_REF", f"{icc_xref} 0 R")
+    doc.update_stream(xref, zlib.compress(samples), compress=False)
+    for key in ("SMask", "DecodeParms", "Decode"):
+        doc.xref_set_key(xref, key, "null")
+    doc.xref_set_key(xref, "Filter", "/FlateDecode")
+    doc.xref_set_key(xref, "ColorSpace", colorspace)
+    doc.xref_set_key(xref, "BitsPerComponent", "8")
+    return pymupdf.open(stream=doc.tobytes(), filetype="pdf")
+
+
+def _two_tone(pixel_a, pixel_b):
+    """Samples: left half pixel_a (with a block of pixel_b to erase)."""
+    rows = []
+    for y in range(H):
+        row = b""
+        for x in range(W):
+            in_block = 18 <= x < 26 and 18 <= y < 26
+            row += pixel_b if in_block else pixel_a
+        rows.append(row)
+    return b"".join(rows)
+
+
+COLORSPACE_CASES = {
+    "DeviceGray": ("/DeviceGray", bytes([170]), bytes([20])),
+    "DeviceRGB": ("/DeviceRGB", bytes([200, 60, 60]), bytes([0, 0, 0])),
+    "CMYK": ("/DeviceCMYK", bytes([0, 200, 200, 0]), bytes([0, 0, 0, 255])),
+    "Separation": ("[/Separation /Spot /DeviceCMYK <</FunctionType 2 /Domain [0 1] "
+                   "/C0 [0 0 0 0] /C1 [0 0.9 0.9 0] /N 1>>]", bytes([204]), bytes([10])),
+    "Lab": ("[/Lab <</WhitePoint [0.9505 1 1.089]>>]", bytes([128, 200, 128]),
+            bytes([20, 128, 128])),
+    "Indexed": ("[/Indexed /DeviceRGB 1 <00FF00 0000FF>]", bytes([1]), bytes([0])),
+}
+
+
+@pytest.mark.parametrize("name", list(COLORSPACE_CASES) + ["ICC ROMM"])
+def test_erasing_keeps_the_image_colours(name):
+    """Pixels outside the erased spot must look exactly as before, whatever
+    the image's colour space (the bug: samples re-tagged as DeviceRGB/Gray
+    recoloured spot-colour, Lab and ICC images)."""
+    if name == "ICC ROMM":
+        import os
+        if not os.path.exists(ROMM):
+            pytest.skip("macOS ROMM RGB profile not available")
+        doc = _image_with_colorspace("[/ICCBased ICC_REF]",
+                                     _two_tone(bytes([200, 60, 60]), bytes([0, 0, 0])),
+                                     icc=open(ROMM, "rb").read())
+    else:
+        colorspace, a, b = COLORSPACE_CASES[name]
+        doc = _image_with_colorspace(colorspace, _two_tone(a, b))
+    outside = (150, 150)
+    block = (20 + 22 * 2.5, 20 + 22 * 2.5)   # centre of the block, in page pts
+    before = _pixel(doc[0], *outside)
+    block_before = _pixel(doc[0], *block)
+    assert block_before != before
+
+    done = er.apply_erase(doc, 0, er.ErasePlan(0, area=pymupdf.Rect(60, 60, 90, 90)))
+
+    assert done["images"] + done["patches"] >= 1
+    assert _close(_pixel(doc[0], *outside), before, tol=3)
+    assert _close(_pixel(doc[0], *block), before, tol=12)   # block filled to match
+
+
+def test_icc_and_spot_images_keep_their_colour_space_entry():
+    colorspace, a, b = COLORSPACE_CASES["Separation"]
+    doc = _image_with_colorspace(colorspace, _two_tone(a, b))
+    er.apply_erase(doc, 0, er.ErasePlan(0, area=pymupdf.Rect(60, 60, 90, 90)))
+    assert "/Separation" in _image_key(doc, "ColorSpace")
+
+
+def test_cmyk_images_are_converted_and_tagged_rgb():
+    colorspace, a, b = COLORSPACE_CASES["CMYK"]
+    doc = _image_with_colorspace(colorspace, _two_tone(a, b))
+    done = er.apply_erase(doc, 0, er.ErasePlan(0, area=pymupdf.Rect(60, 60, 90, 90)))
+    assert done["images"] == 1
+    assert _image_key(doc, "ColorSpace") == "/DeviceRGB"
+
+
+def test_jpeg_keeps_its_chroma_subsampling():
+    img = _noisy_paper(400, 300, sigma=6)
+    ImageDraw.Draw(img).rectangle((100, 100, 200, 120), fill=(20, 20, 20))
+    doc = _single_image_doc(img, "JPEG", quality=85, subsampling=0)   # 4:4:4
+    er.apply_erase(doc, 0, er.ErasePlan(0, area=pymupdf.Rect(98, 98, 202, 122)))
+    from PIL import JpegImagePlugin
+    xref = doc[0].get_image_info(xrefs=True)[0]["xref"]
+    stored = Image.open(io.BytesIO(doc.xref_stream_raw(xref)))
+    assert JpegImagePlugin.get_sampling(stored) == 0
+
+
+def test_jpeg2000_scan_becomes_compact_jpeg():
+    img = _noisy_paper(800, 600, sigma=6)
+    ImageDraw.Draw(img).rectangle((200, 200, 400, 240), fill=(20, 20, 20))
+    try:
+        doc = _single_image_doc(img, "JPEG2000", quality_mode="rates",
+                                quality_layers=[40])
+    except (OSError, KeyError):
+        pytest.skip("Pillow was built without JPEG 2000 support")
+    assert "JPXDecode" in _image_key(doc, "Filter")
+    before = _saved_size(doc)
+
+    er.apply_erase(doc, 0, er.ErasePlan(0, area=pymupdf.Rect(98, 98, 202, 122)))
+
+    assert "DCTDecode" in _image_key(doc, "Filter")
+    assert _saved_size(doc) < 3 * before
+    assert not _is_dark(_pixel(doc[0], 150, 110))
+
+
+def test_orphaned_objects_do_not_count_as_sharing(scan_doc):
+    """Removing text rewrites the page's resources and orphans the old
+    resource dictionary (which still names the image). That mustn't make
+    the scan look shared and get it patched instead of edited."""
+    er.apply_erase(scan_doc, 0, er.ErasePlan(0, words=[_word(scan_doc, "Visible")]))
+    done = er.apply_erase(scan_doc, 0, er.ErasePlan(0, words=[_word(scan_doc, "SCANNED")]))
+    assert done["images"] == 1 and done["patches"] == 0

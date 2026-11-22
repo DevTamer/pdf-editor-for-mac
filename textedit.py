@@ -59,6 +59,7 @@ separate runs, so editing one never flattens another's style.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -316,11 +317,108 @@ def _char_counts(page: pymupdf.Page) -> Counter:
 # Fonts
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Annotations
+# ---------------------------------------------------------------------------
+#
+# Comment boxes (FreeText), stamps and form fields draw their own text, and
+# PyMuPDF's text extraction reports it alongside the page's. But it isn't
+# page content: a redaction over it deletes the whole annotation. So that
+# text is refused up front, and every removal also checks that no
+# annotation disappeared.
+
+_TEXT_ANNOT_TYPES = (pymupdf.PDF_ANNOT_FREE_TEXT, pymupdf.PDF_ANNOT_STAMP,
+                     pymupdf.PDF_ANNOT_WIDGET)
+
+ANNOTATION_TEXT_ERROR = (
+    "This text is part of (or under) a comment box, stamp or form field. "
+    "The editor can't change those yet.")
+ANNOTATION_LOST_ERROR = (
+    "That would also have removed a comment, stamp or form field, so "
+    "nothing was changed.")
+
+
+def annotation_boxes(page: pymupdf.Page) -> List[pymupdf.Rect]:
+    """Areas of annotations and form fields that draw their own text."""
+    boxes = [pymupdf.Rect(a.rect) for a in page.annots(types=_TEXT_ANNOT_TYPES)]
+    boxes += [pymupdf.Rect(w.rect) for w in page.widgets()]
+    return boxes
+
+
+def touches_annotation(page: pymupdf.Page, rect: pymupdf.Rect) -> bool:
+    return any(rect.intersects(box) for box in annotation_boxes(page))
+
+
+def annotation_inventory(page: pymupdf.Page) -> set:
+    """Every annotation, link and form field on the page (by object
+    number), except redaction marks."""
+    # (PyMuPDF 1.24 returns (xref, type, id) triples here.)
+    return {entry[0] for entry in page.annot_xrefs()
+            if entry[1] != pymupdf.PDF_ANNOT_REDACT}
+
+
+def check_annotations_kept(page: pymupdf.Page, before: set) -> None:
+    if annotation_inventory(page) != before:
+        raise EditError(ANNOTATION_LOST_ERROR)
+
+
+# ---------------------------------------------------------------------------
+# Writing text
+# ---------------------------------------------------------------------------
+
+_WRITER_OFFSETS: Dict[Tuple, Tuple[float, float]] = {}
+
+
+def _writer_offset(page: pymupdf.Page) -> Tuple[float, float]:
+    """How far TextWriter misplaces text on this page's geometry.
+
+    In PyMuPDF 1.24, on a page whose CropBox has different top and bottom
+    margins, TextWriter puts text off vertically by the difference. Rather
+    than hard-code that (and break when PyMuPDF fixes it), measure it once
+    per MediaBox/CropBox with a probe on a scratch page.
+    """
+    key = (tuple(page.mediabox), tuple(page.cropbox))
+    if key not in _WRITER_OFFSETS:
+        scratch = pymupdf.open()
+        try:
+            probe = scratch.new_page(width=page.mediabox.width,
+                                     height=page.mediabox.height)
+            probe.set_mediabox(page.mediabox)
+            probe.set_cropbox(page.cropbox)
+            want = pymupdf.Point(probe.rect.width / 2, probe.rect.height / 2)
+            writer = pymupdf.TextWriter(probe.rect)
+            writer.append(want, "x", font=pymupdf.Font("helv"), fontsize=10)
+            writer.write_text(probe)
+            got = pymupdf.Point(
+                probe.get_text("dict")["blocks"][0]["lines"][0]["spans"][0]["origin"])
+            _WRITER_OFFSETS[key] = (got.x - want.x, got.y - want.y)
+        except Exception:
+            _WRITER_OFFSETS[key] = (0.0, 0.0)  # verification will catch it
+        finally:
+            scratch.close()
+    return _WRITER_OFFSETS[key]
+
+
+def write_text(page: pymupdf.Page, origin: Tuple[float, float],
+               pieces: List[Tuple[str, pymupdf.Font]], size: float,
+               color: Tuple[float, float, float]) -> None:
+    """Write text pieces one after another from baseline ``origin``."""
+    dx, dy = _writer_offset(page)
+    writer = pymupdf.TextWriter(page.rect)
+    position = pymupdf.Point(origin[0] - dx, origin[1] - dy)
+    for text, font in pieces:
+        _rect, position = writer.append(position, text, font=font, fontsize=size)
+    writer.write_text(page, color=color)
+
+
 def normalize_font_name(name: str) -> str:
     """'ABCDEF+Nimbus Roman-Regular' -> 'nimbusromanregular': no subset
     prefix, case or punctuation, so the names a PDF's font objects use and
     the names text extraction reports can be compared."""
-    return re.sub(r"[^a-z0-9]", "", _SUBSET_PREFIX.sub("", name).lower())
+    name = re.sub(r"[^a-z0-9]", "", _SUBSET_PREFIX.sub("", name).lower())
+    # "Arial Unicode MS Regular" (as declared) vs "ArialUnicodeMS" (as
+    # extracted): a trailing "Regular" carries no information.
+    return name[:-len("regular")] if name.endswith("regular") and name != "regular" else name
 
 
 @dataclass(frozen=True)
@@ -515,6 +613,15 @@ def _unique(chars) -> List[str]:
     return list(dict.fromkeys(chars))
 
 
+PENDING_REDACTIONS_ERROR = (
+    "This page has unapplied redaction marks. Changing it would apply them "
+    "too, so apply or remove them in a redaction tool first.")
+
+
+def has_pending_redactions(page: pymupdf.Page) -> bool:
+    return any(True for _ in page.annots(types=[pymupdf.PDF_ANNOT_REDACT]))
+
+
 def plan_edit(doc: pymupdf.Document, page: pymupdf.Page, run: TextRun,
               new_text: str, runs: Optional[List[TextRun]] = None) -> EditPlan:
     """Decide how ``run`` would be replaced by ``new_text``, without
@@ -535,11 +642,10 @@ def plan_edit(doc: pymupdf.Document, page: pymupdf.Page, run: TextRun,
             ord(c) < 32 for c in new_text):
         plan.errors.append("Line breaks, tabs and control characters "
                            "aren't supported in edited text.")
-    if any(True for _ in page.annots(types=[pymupdf.PDF_ANNOT_REDACT])):
-        plan.errors.append(
-            "This page has unapplied redaction marks. Applying an edit would "
-            "apply them too, so apply or remove them in a redaction tool "
-            "first.")
+    if has_pending_redactions(page):
+        plan.errors.append(PENDING_REDACTIONS_ERROR)
+    if touches_annotation(page, run.rect):
+        plan.errors.append(ANNOTATION_TEXT_ERROR)
     if plan.errors:
         return plan
 
@@ -611,22 +717,20 @@ def apply_edit(page: pymupdf.Page, plan: EditPlan) -> None:
                         "Click it again to edit it.")
 
     expected_after_removal = _char_counts(page) - _counted(run.text)
+    annotations = annotation_inventory(page)
 
     page.add_redact_annot(removal_rect(run), fill=False)
     page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
                           graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
+    check_annotations_kept(page, annotations)
     if _char_counts(page) != expected_after_removal:
         raise EditError("Removing the old text would also have changed "
                         "nearby text, so the edit was cancelled.")
 
     if plan.segments:
-        writer = pymupdf.TextWriter(page.rect)
-        position = pymupdf.Point(run.origin)
-        for segment in plan.segments:
-            _rect, position = writer.append(position, segment.text,
-                                            font=segment.choice.font,
-                                            fontsize=run.size)
-        writer.write_text(page, color=run.color)
+        write_text(page, run.origin,
+                   [(s.text, s.choice.font) for s in plan.segments],
+                   run.size, run.color)
 
     if (_char_counts(page) != expected_after_removal + _counted(plan.new_text)
             or not _reads_back(page, plan)):
@@ -708,7 +812,7 @@ def plan_add_text(page: pymupdf.Page, page_num: int,
     if style.family not in FAMILIES:
         plan.errors.append(f"Unknown font family “{style.family}”.")
         return plan
-    if not MIN_SIZE <= style.size <= MAX_SIZE:
+    if not (math.isfinite(style.size) and MIN_SIZE <= style.size <= MAX_SIZE):
         plan.errors.append(f"Font size must be between {MIN_SIZE:g} and "
                            f"{MAX_SIZE:g} pt.")
     if page.rotation:
@@ -733,10 +837,9 @@ def apply_add_text(page: pymupdf.Page, plan: AddPlan) -> None:
     if not plan.can_apply:
         raise EditError(plan.errors[0] if plan.errors else "There's no text to add.")
     expected = _char_counts(page) + _counted(plan.text)
-    writer = pymupdf.TextWriter(page.rect)
-    writer.append(plan.origin, plan.text, font=pymupdf.Font(plan.style.font_code),
-                  fontsize=plan.style.size)
-    writer.write_text(page, color=plan.style.color)
+    write_text(page, plan.origin,
+               [(plan.text, pymupdf.Font(plan.style.font_code))],
+               plan.style.size, plan.style.color)
     probe = EditPlan(run=TextRun(plan.page_num, "", "", plan.style.size, 0,
                                  plan.style.color, plan.origin, (0, 0, 0, 0),
                                  (1.0, 0.0)),

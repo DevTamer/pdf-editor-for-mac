@@ -346,3 +346,32 @@ def test_erase_then_save(model, tmp_path):
     assert "Quarterly" not in saved[0].get_text()
     assert "Report" in saved[0].get_text()
     saved.close()
+
+
+def test_history_depth_is_bounded_by_memory(sample_pdf_path, monkeypatch):
+    """Every undo step holds a full copy of the document, so big files get
+    fewer steps (but never fewer than MIN_HISTORY)."""
+    import editor
+    m = EditorModel()
+    m.open_document(str(sample_pdf_path))
+    assert m.history.limit == editor.HISTORY_LIMIT        # small file: full depth
+    monkeypatch.setattr(editor, "HISTORY_BUDGET", 1)
+    m.open_document(str(sample_pdf_path))
+    assert m.history.limit == editor.MIN_HISTORY
+    m.close_document()
+
+
+def test_edits_work_on_pages_with_annotations(model):
+    """Regression: the annotation safety check crashed on any page that had
+    an annotation or link (PyMuPDF returns triples from annot_xrefs)."""
+    page = model.get_page(0)
+    page.insert_link({"kind": pymupdf.LINK_URI, "from": pymupdf.Rect(300, 400, 350, 420),
+                      "uri": "https://example.com"})
+    page.add_text_annot((400, 500), "a sticky note")
+    model.record_snapshot("Annotated")
+    # (get_links() caches per page object, so compare the annotation list.)
+    before = sorted(entry[1] for entry in model.get_page(0).annot_xrefs())
+    assert {pymupdf.PDF_ANNOT_TEXT, pymupdf.PDF_ANNOT_LINK} <= set(before)
+    _edit(model, TARGET, "Edited next to a link")
+    assert "Edited next to a link" in _page_text(model)
+    assert sorted(entry[1] for entry in model.get_page(0).annot_xrefs()) == before

@@ -78,8 +78,11 @@ def test_run_at_prefers_the_smallest_overlapping_run():
 
 @pytest.mark.parametrize("name, expected", [
     ("ABCDEF+Calibri-Bold", "calibribold"),
-    ("Nimbus Roman Regular", "nimbusromanregular"),
-    ("NimbusRoman-Regular", "nimbusromanregular"),
+    ("Nimbus Roman Regular", "nimbusroman"),
+    ("NimbusRoman-Regular", "nimbusroman"),
+    ("Arial Unicode MS Regular", "arialunicodems"),   # declared vs...
+    ("ArialUnicodeMS", "arialunicodems"),             # ...extracted
+    ("Regular", "regular"),
     ("Times New Roman,Bold", "timesnewromanbold"),
     ("abcdef+Lower", "abcdeflower"),  # not a subset prefix: lowercase
 ])
@@ -584,3 +587,100 @@ def test_style_font_codes():
     assert te.TextStyle("Times", bold=True).font_code == "tibo"
     assert te.TextStyle("Courier", italic=True).font_code == "coit"
     assert te.TextStyle("Helvetica", bold=True, italic=True).label == "Helvetica Bold Oblique"
+
+
+# ---------------------------------------------------------------------------
+# Review regressions: annotations and cropped pages
+# ---------------------------------------------------------------------------
+
+def _doc_with_freetext():
+    doc = pymupdf.open()
+    page = doc.new_page(width=300, height=300)
+    page.insert_text((20, 40), "Body text", fontname="helv", fontsize=12)
+    page.insert_text((110, 200), "Under the box", fontname="helv", fontsize=12)
+    page.add_highlight_annot(pymupdf.Rect(20, 30, 80, 42))
+    note = page.add_freetext_annot(pymupdf.Rect(100, 100, 250, 130), "APPROVED",
+                                   fontsize=14, fill_color=(1, 1, 0.6))
+    note.update(fill_color=(1, 1, 0.6))
+    page.add_freetext_annot(pymupdf.Rect(100, 185, 250, 210), "COVER", fontsize=9)
+    return pymupdf.open(stream=doc.tobytes(), filetype="pdf")
+
+
+def _annot_types(page):
+    return sorted(a.type[1] for a in page.annots())
+
+
+@pytest.mark.parametrize("text", ["APPROVED", "Under the box"])
+def test_comment_box_text_is_refused(text):
+    """A FreeText comment's own text, or page text under one, can't be
+    edited: a redaction there deletes the whole comment."""
+    doc = _doc_with_freetext()
+    page = doc[0]
+    run = next(r for r in te.page_runs(page, 0) if r.text.strip() == text)
+    plan = te.plan_edit(doc, page, run, "Changed")
+    assert not plan.can_apply
+    assert "comment box" in plan.errors[0]
+
+
+def test_text_next_to_annotations_still_edits_and_keeps_them():
+    doc = _doc_with_freetext()
+    page = doc[0]
+    before = _annot_types(page)
+    run = next(r for r in te.page_runs(page, 0) if r.text.strip() == "Body text")
+    te.apply_edit(page, te.plan_edit(doc, page, run, "Body TEXT"))
+    assert "Body TEXT" in page.get_text()
+    assert _annot_types(page) == before          # highlight + comments intact
+
+
+def test_losing_an_annotation_is_detected(monkeypatch):
+    """Backstop: even if the up-front check missed it, a removal that
+    deletes an annotation is refused (the caller then restores the page)."""
+    doc = _doc_with_freetext()
+    page = doc[0]
+    monkeypatch.setattr(te, "touches_annotation", lambda page, rect: False)
+    run = next(r for r in te.page_runs(page, 0) if r.text.strip() == "APPROVED")
+    plan = te.plan_edit(doc, page, run, "APPROVED!")
+    with pytest.raises(te.EditError, match="comment, stamp or form field"):
+        te.apply_edit(page, plan)
+
+
+CROPS = [None, (0, 0, 612, 700), (0, 92, 612, 792), (100, 100, 500, 700),
+         (50, 20, 560, 760)]
+
+
+def _cropped_doc(crop):
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((200, 300), "Cropped page text", fontname="helv", fontsize=12)
+    doc = pymupdf.open(stream=doc.tobytes(), filetype="pdf")
+    if crop:
+        doc[0].set_cropbox(pymupdf.Rect(crop))
+    return pymupdf.open(stream=doc.tobytes(), filetype="pdf")
+
+
+@pytest.mark.parametrize("crop", CROPS)
+def test_edit_on_cropped_pages(crop):
+    """PyMuPDF's TextWriter misplaces text when a page's CropBox has
+    uneven top/bottom margins; edits must land where the old text was."""
+    doc = _cropped_doc(crop)
+    page = doc[0]
+    run = te.page_runs(page, 0)[0]
+    te.apply_edit(page, te.plan_edit(doc, page, run, "Edited on a crop"))
+    new = next(r for r in te.page_runs(page, 0) if r.text == "Edited on a crop")
+    assert new.origin == pytest.approx(run.origin, abs=0.05)
+
+
+@pytest.mark.parametrize("crop", CROPS)
+def test_add_text_on_cropped_pages(crop):
+    doc = _cropped_doc(crop)
+    page = doc[0]
+    plan = te.plan_add_text(page, 0, (60, 100), "Added on a crop", te.TextStyle())
+    te.apply_add_text(page, plan)
+    new = next(r for r in te.page_runs(page, 0) if r.text == "Added on a crop")
+    assert new.origin == pytest.approx(plan.origin, abs=0.05)
+
+
+@pytest.mark.parametrize("size", [float("nan"), float("inf"), -3.0])
+def test_add_text_rejects_nonsense_sizes(sample_doc, size):
+    plan = te.plan_add_text(sample_doc[0], 0, (60, 300), "x", te.TextStyle(size=size))
+    assert not plan.can_apply and "between" in plan.errors[0]

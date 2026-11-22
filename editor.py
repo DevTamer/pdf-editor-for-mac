@@ -17,6 +17,7 @@ from pdfcore.frozen import configure_bundled_tcl_tk
 
 configure_bundled_tcl_tk()
 
+import math  # noqa: E402
 import tempfile  # noqa: E402
 import tkinter as tk  # noqa: E402  (must follow configure_bundled_tcl_tk)
 from tkinter import colorchooser, filedialog, messagebox, ttk  # noqa: E402
@@ -47,7 +48,9 @@ DEFAULT_WINDOW_SIZE = "1200x800"
 MIN_WINDOW_WIDTH = 900
 MIN_WINDOW_HEIGHT = 600
 SIDEBAR_WIDTH = 280
-HISTORY_LIMIT = 30  # Max snapshots kept in the undo/redo history
+HISTORY_LIMIT = 30  # Max snapshots kept in the undo/redo history...
+HISTORY_BUDGET = 400 * 1024 * 1024  # ...and roughly the memory they may use
+MIN_HISTORY = 5     # but always at least this many, however big the file
 
 TOOL_EDIT = "edit"
 TOOL_ADD = "add"
@@ -82,7 +85,9 @@ def _hex(color: Tuple[float, float, float]) -> str:
 
 def _tk_font(family: str, size_px: float, bold: bool, italic: bool):
     style = " ".join(s for s, on in (("bold", bold), ("italic", italic)) if on)
-    return (family, -max(8, round(size_px)), style or "normal")
+    if not math.isfinite(size_px):
+        size_px = 16  # a nonsense size typed in the sidebar; the add is refused later
+    return (family, -max(8, min(400, round(size_px))), style or "normal")
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +113,10 @@ class EditorModel(DocumentSession):
         # If this fails (unreadable or password-protected file), pdfcore
         # leaves the current document, its history and our state untouched.
         super().open_document(path)
+        # Every undo step holds a full copy of the document: cap the count so
+        # a big scan doesn't eat gigabytes of memory.
+        size = max(1, len(self.history.current.doc_bytes))
+        self.history.limit = max(MIN_HISTORY, min(HISTORY_LIMIT, HISTORY_BUDGET // size))
         self._saved_entry = self.history.current
         self.save_path = None
 
@@ -273,6 +282,8 @@ class EditCanvas(PageView):
         self._words: List[Word] = []
         self._hover = None
         self.editing_run: Optional[TextRun] = None
+        # (page_num, top-left in PDF points) while an Add Text box is open.
+        self.adding_at: Optional[Tuple[int, Tuple[float, float]]] = None
         self.entry: Optional[tk.Entry] = None
         self._on_commit = self._on_cancel = lambda: None
         # Erase drag state
@@ -475,19 +486,22 @@ class EditCanvas(PageView):
         self.editing_run = run
         return entry
 
-    def begin_add_text(self, pdf_xy: Tuple[float, float], style: TextStyle,
-                       on_commit, on_cancel) -> tk.Entry:
+    def begin_add_text(self, page_num: int, pdf_xy: Tuple[float, float],
+                       style: TextStyle, on_commit, on_cancel) -> tk.Entry:
         """Put an empty text box with its top-left corner at ``pdf_xy``."""
         cx, cy = self.pdf_to_canvas(*pdf_xy)
         size_px = style.size * self.mapper.total_scale
-        return self._open_entry(
-            cx - 3, cy - 3, MIN_EDITOR_WIDTH + 80, max(size_px * 1.4 + 6, 18),
+        height = size_px * 1.4 + 6 if math.isfinite(size_px) else 24
+        entry = self._open_entry(
+            cx - 3, cy - 3, MIN_EDITOR_WIDTH + 80, max(min(height, 600), 18),
             _tk_font(style.family, size_px, style.bold, style.italic),
             _hex(style.color), "", "end", on_commit, on_cancel)
+        self.adding_at = (page_num, pdf_xy)   # only once the box exists
+        return entry
 
     def restyle_entry(self, style: TextStyle) -> None:
         """Update an open add-text box to show the new style."""
-        if self.entry is not None and self.editing_run is None:
+        if self.entry is not None and self.adding_at is not None:
             self.entry.configure(
                 font=_tk_font(style.family, style.size * self.mapper.total_scale,
                               style.bold, style.italic),
@@ -511,6 +525,7 @@ class EditCanvas(PageView):
         self.entry.destroy()
         self.entry = None
         self.editing_run = None
+        self.adding_at = None
         return text
 
     def cancel_inline_edit(self) -> None:
@@ -539,7 +554,6 @@ class EditorApp:
         self.bold_var = tk.BooleanVar(value=False)
         self.italic_var = tk.BooleanVar(value=False)
         self.text_color: Tuple[float, float, float] = (0.0, 0.0, 0.0)
-        self._adding_at: Optional[Tuple[int, Tuple[float, float]]] = None
 
         self._build_menu()
         self._build_toolbar()
@@ -560,9 +574,9 @@ class EditorApp:
         self.root.bind("<Command-Shift-s>", lambda e: self._on_save_as())
         self.root.bind("<Command-Shift-S>", lambda e: self._on_save_as())
         self.root.bind("<Command-w>", lambda e: self._on_close_doc())
-        self.root.bind("<Command-z>", lambda e: self._on_undo())
-        self.root.bind("<Command-Shift-z>", lambda e: self._on_redo())
-        self.root.bind("<Command-Shift-Z>", lambda e: self._on_redo())
+        self.root.bind("<Command-z>", lambda e: self._shortcut(self._on_undo))
+        self.root.bind("<Command-Shift-z>", lambda e: self._shortcut(self._on_redo))
+        self.root.bind("<Command-Shift-Z>", lambda e: self._shortcut(self._on_redo))
         for number, tool in enumerate(TOOLS, start=1):
             self.root.bind(f"<Command-Key-{number}>",
                            lambda e, t=tool: self.set_tool(t))
@@ -818,10 +832,10 @@ class EditorApp:
                          color=self.text_color)
 
     def _on_style_change(self) -> None:
-        if self._adding_at is not None:
+        if self.view.adding_at is not None:
             try:
                 self.view.restyle_entry(self.current_style())
-            except (tk.TclError, KeyError):
+            except (tk.TclError, KeyError, ValueError):
                 pass
 
     def _choose_color(self) -> None:
@@ -914,7 +928,6 @@ class EditorApp:
 
     def _cancel_inline_edit(self) -> None:
         self.view.cancel_inline_edit()
-        self._adding_at = None
         self._set_status("Cancelled")
 
     def _commit_inline_edit(self) -> bool:
@@ -923,7 +936,7 @@ class EditorApp:
         error; the box stays open in that case."""
         if self.view.entry is None:
             return True
-        if self._adding_at is not None:
+        if self.view.adding_at is not None:
             return self._commit_add_text()
         run = self.view.editing_run
         new_text = self.view.entry.get()
@@ -962,18 +975,17 @@ class EditorApp:
             # Committing may re-render the page; pdf_xy stays valid.
             if not self._commit_inline_edit():
                 return
-        self._adding_at = (self.model.current_page, pdf_xy)
-        self.view.begin_add_text(pdf_xy, self.current_style(),
+        self.view.begin_add_text(self.model.current_page, pdf_xy,
+                                 self.current_style(),
                                  on_commit=self._commit_inline_edit,
                                  on_cancel=self._cancel_inline_edit)
         self._set_status("Adding text — Return to add, Esc to cancel")
 
     def _commit_add_text(self) -> bool:
-        page_num, top_left = self._adding_at
+        page_num, top_left = self.view.adding_at
         text = self.view.entry.get()
         if not text.strip():
             self.view.end_inline_edit()
-            self._adding_at = None
             self._set_status("Nothing added")
             return True
         plan = self.model.plan_add_text(page_num, top_left, text,
@@ -984,7 +996,6 @@ class EditorApp:
             self._refocus_entry()
             return False
         self.view.end_inline_edit()
-        self._adding_at = None
         try:
             label = self.model.apply_add(plan)
         except EditError as exc:
@@ -1011,9 +1022,12 @@ class EditorApp:
     # -- File operations ------------------------------------------------------
 
     def _confirm_discard(self) -> bool:
-        """Ask before throwing away unsaved changes. True = go ahead."""
-        if self.view.entry is not None:
-            self._cancel_inline_edit()
+        """Ask before throwing away unsaved changes. True = go ahead.
+
+        Text being typed counts as a change: it's applied first, so it's
+        included if the user chooses to save (and asked about if not)."""
+        if self.view.entry is not None and not self._commit_inline_edit():
+            return False
         if not self.model.is_dirty:
             return True
         answer = messagebox.askyesnocancel(
@@ -1158,6 +1172,23 @@ class EditorApp:
         self._refresh_page()
         self._update_history_list()
         self._set_status(f"{verb} — now at: {label}")
+
+    def _typing_elsewhere(self) -> bool:
+        """Whether the keyboard focus is in a text field other than the
+        inline text box (the size box, Go to page...). Cmd+Z there must not
+        undo document changes."""
+        try:
+            focus = self.root.focus_get()
+        except (KeyError, tk.TclError):
+            return False
+        return (isinstance(focus, (tk.Entry, ttk.Entry))
+                and focus is not self.view.entry)
+
+    def _shortcut(self, action) -> None:
+        """Run a document-level keyboard shortcut, unless the user is typing
+        in another text field (the menu items and buttons always work)."""
+        if not self._typing_elsewhere():
+            action()
 
     def _on_undo(self) -> None:
         if self.model.doc and self.model.can_undo():

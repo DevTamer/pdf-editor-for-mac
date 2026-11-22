@@ -512,3 +512,110 @@ def test_undo_after_erase(app):
     _press_move_release(app, _word_center(app, "Report"))
     app._on_undo()
     assert "Quarterly Report" in _page_text(app)
+
+
+# -- Review regressions ------------------------------------------------------------
+
+def test_nonsense_size_does_not_leak_add_state_into_edits(app, monkeypatch):
+    """A size like "nan" used to crash opening the add box while leaving
+    the add state behind, so the next *edit* was applied as an added line."""
+    shown = []
+    monkeypatch.setattr(editor.messagebox, "showerror",
+                        lambda title, message: shown.append(message))
+    app.set_tool("add")
+    app.size_var.set("nan")
+    app.view._on_click(_Event(60 * SCALE, 300 * SCALE))
+    _type(app, "Should not be added")
+    assert app._commit_inline_edit() is False             # refused, box kept
+    assert shown and "between" in shown[0]
+    _press(app, "<Escape>")
+    assert app.view.adding_at is None
+
+    app.size_var.set("12")
+    app.set_tool("edit")
+    _click(app, TARGET)
+    _type(app, "Target line EDITED")
+    _press(app, "<Return>")
+    assert app.model.history_entries()[-1].startswith("Edit “Target line to edit”")
+    assert "Target line EDITED" in _page_text(app)
+    assert TARGET not in _page_text(app)
+
+
+def test_add_then_edit_is_an_edit(app):
+    app.set_tool("add")
+    app.view._on_click(_Event(60 * SCALE, 300 * SCALE))
+    _type(app, "Fresh line")
+    _press(app, "<Return>")
+    assert app.view.adding_at is None
+    app.set_tool("edit")
+    _click(app, "Fresh line")
+    _type(app, "Fresh line, edited")
+    _press(app, "<Return>")
+    assert app.model.history_entries()[-1].startswith("Edit “Fresh line”")
+
+
+def test_typed_text_is_saved_when_closing_with_save(app, tmp_path, monkeypatch):
+    out = tmp_path / "closed.pdf"
+    monkeypatch.setattr(editor.messagebox, "askyesnocancel", lambda *a, **k: True)
+    monkeypatch.setattr(editor.filedialog, "asksaveasfilename", lambda **k: str(out))
+    _click(app, TARGET)
+    _type(app, "Typed but not applied")
+    app._on_close_doc()
+    assert app.model.doc is None
+    saved = pymupdf.open(str(out))
+    assert "Typed but not applied" in saved[0].get_text()
+    saved.close()
+
+
+def test_closing_a_clean_document_with_typing_asks(app, monkeypatch):
+    asked = []
+    monkeypatch.setattr(editor.messagebox, "askyesnocancel",
+                        lambda *a, **k: asked.append(1))   # None = cancel
+    _click(app, TARGET)
+    _type(app, "Would be lost")
+    app._on_close_doc()
+    assert asked and app.model.doc is not None            # asked, then cancelled
+
+
+def test_undo_shortcut_leaves_other_text_fields_alone(app, monkeypatch):
+    _click(app, TARGET)
+    _type(app, "Edited")
+    _press(app, "<Return>")
+    monkeypatch.setattr(app.root, "focus_get", lambda: app.size_box)
+    app._shortcut(app._on_undo)                    # Cmd+Z typed in the size box
+    assert "Edited" in _page_text(app)
+    app._on_undo()                                 # the Undo button still works
+    assert TARGET in _page_text(app)
+
+
+def test_clicking_inside_the_text_being_edited_keeps_typing(app):
+    _click(app, TARGET)
+    _type(app, "Half typed")
+    _click(app, TARGET)
+    assert app.view.entry is not None and app.view.entry.get() == "Half typed"
+    assert app.history_list.size() == 1
+
+
+def test_resize_with_a_box_open_keeps_it(app):
+    _click(app, TARGET)
+    _type(app, "Still typing")
+    app._do_resize()
+    assert app.view.entry is not None and app.view.entry.get() == "Still typing"
+
+
+def test_changing_page_applies_the_open_box(app):
+    _click(app, TARGET)
+    _type(app, "Applied by paging")
+    app._next_page()
+    assert app.view.entry is None
+    assert app.model.current_page == 1
+    assert "Applied by paging" in app.model.get_page(0).get_text()
+
+
+def test_redisplaying_the_page_closes_any_open_box(app):
+    """show_page clears the canvas; a box left 'open' behind it would be
+    orphaned while the app still thought it was editing."""
+    _click(app, TARGET)
+    app.view.display_page(0)
+    assert app.view.entry is None and app.view.editing_run is None
+    assert app.canvas.find_withtag("editor") == ()

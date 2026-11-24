@@ -544,7 +544,7 @@ def test_added_text_can_be_edited_without_warnings(sample_doc):
     ("two\nlines", te.TextStyle(), "Line breaks"),
     ("ok", te.TextStyle(size=2), "between"),
     ("ok", te.TextStyle(size=500), "between"),
-    ("ok", te.TextStyle(family="Comic Sans"), "Unknown font"),
+    ("ok", te.TextStyle(family="Comic Sans"), "isn't available"),
 ])
 def test_add_text_rejects_bad_input(sample_doc, text, style, message):
     plan = te.plan_add_text(sample_doc[0], 0, (60, 300), text, style)

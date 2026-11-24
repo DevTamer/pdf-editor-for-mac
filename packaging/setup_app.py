@@ -96,8 +96,8 @@ DATA_FILES += bundle_dir_as_data_files(
 OPTIONS = {
     "argv_emulation": False,
     "iconfile": "icon.icns",
-    "packages": ["pymupdf", "PIL", "pdfcore"],
-    "includes": ["textedit", "erase"],
+    "packages": ["pymupdf", "PIL", "pdfcore", "fontTools"],
+    "includes": ["textedit", "erase", "fontmatch"],
     "plist": {
         "CFBundleName": "PDF Editor",
         "CFBundleDisplayName": "PDF Editor",

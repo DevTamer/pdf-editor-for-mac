@@ -21,6 +21,7 @@ import math  # noqa: E402
 import tempfile  # noqa: E402
 import tkinter as tk  # noqa: E402  (must follow configure_bundled_tcl_tk)
 from tkinter import colorchooser, filedialog, messagebox, ttk  # noqa: E402
+from tkinter import font as tkfont  # noqa: E402
 from typing import Callable, List, Optional, Tuple  # noqa: E402
 
 import pymupdf  # noqa: E402
@@ -32,6 +33,7 @@ from erase import (  # noqa: E402
     FILL_COLOR, FILL_CONTENT, ErasePlan, Word, apply_erase, page_words,
     word_at, words_between,
 )
+import fontmatch  # noqa: E402
 from textedit import (  # noqa: E402
     FAMILIES, MAX_SIZE, MIN_SIZE, AddPlan, EditError, EditPlan, TextRun,
     TextStyle,
@@ -142,6 +144,13 @@ class EditorModel(DocumentSession):
 
     def words(self, page_num: int) -> List[Word]:
         return page_words(self.get_page(page_num))
+
+    def display_family(self, run: TextRun) -> Optional[str]:
+        """The installed family that looks like ``run``'s font, to show the
+        text box in: the same font if it's installed. (Only the quick
+        name lookup: the slower lookalike search waits for the edit.)"""
+        face = fontmatch.default_index().exact(run.font, run.bold, run.italic)
+        return face.family if face is not None else None
 
     def describe_font(self, run: TextRun) -> str:
         page = self.get_page(run.page_num)
@@ -286,6 +295,7 @@ class EditCanvas(PageView):
         # (page_num, top-left in PDF points) while an Add Text box is open.
         self.adding_at: Optional[Tuple[int, Tuple[float, float]]] = None
         self.entry: Optional[tk.Entry] = None
+        self._tk_families: Optional[set] = None
         self._on_commit = self._on_cancel = lambda: None
         # Erase drag state
         self._anchor_word: Optional[Word] = None
@@ -471,10 +481,8 @@ class EditCanvas(PageView):
                           click_canvas_x: Optional[float] = None) -> tk.Entry:
         """Put a text box over ``run``, prefilled with its text."""
         x0, y0, x1, y1 = self._canvas_box(run.bbox)
-        family = ("Courier" if run.monospaced
-                  else "Times" if run.serif else "Helvetica")
-        font = _tk_font(family, run.size * self.mapper.total_scale,
-                        run.bold, run.italic)
+        font = _tk_font(self.screen_family(self.model.display_family(run), run),
+                        run.size * self.mapper.total_scale, run.bold, run.italic)
         if click_canvas_x is not None and x1 > x0:
             fraction = max(0.0, min(1.0, (click_canvas_x - x0) / (x1 - x0)))
             cursor = round(fraction * len(run.text))
@@ -495,16 +503,32 @@ class EditCanvas(PageView):
         height = size_px * 1.4 + 6 if math.isfinite(size_px) else 24
         entry = self._open_entry(
             cx - 3, cy - 3, MIN_EDITOR_WIDTH + 80, max(min(height, 600), 18),
-            _tk_font(style.family, size_px, style.bold, style.italic),
+            _tk_font(self.screen_family(style.family), size_px, style.bold,
+                     style.italic),
             _hex(style.color), "", "end", on_commit, on_cancel)
         self.adding_at = (page_num, pdf_xy)   # only once the box exists
         return entry
+
+    def screen_family(self, family: Optional[str],
+                      run: Optional[TextRun] = None) -> str:
+        """A family Tk can draw the text box in: ``family`` if this Mac
+        has it registered (fonts inside Microsoft Office's app bundle
+        aren't), else the generic look of ``run``."""
+        if self._tk_families is None:
+            self._tk_families = set(tkfont.families(self.canvas))
+        if family and family in self._tk_families:
+            return family
+        if run is not None:
+            return ("Courier" if run.monospaced
+                    else "Times" if run.serif else "Helvetica")
+        return "Helvetica"
 
     def restyle_entry(self, style: TextStyle) -> None:
         """Update an open add-text box to show the new style."""
         if self.entry is not None and self.adding_at is not None:
             self.entry.configure(
-                font=_tk_font(style.family, style.size * self.mapper.total_scale,
+                font=_tk_font(self.screen_family(style.family),
+                              style.size * self.mapper.total_scale,
                               style.bold, style.italic),
                 fg=_hex(style.color))
 
@@ -781,7 +805,8 @@ class EditorWindow:
         ttk.Label(row, text="Font").pack(side="left")
         self.family_box = ttk.Combobox(row, textvariable=self.family_var,
                                        values=list(FAMILIES), state="readonly",
-                                       width=11)
+                                       width=11, height=20,
+                                       postcommand=self._fill_families)
         self.family_box.pack(side="left", padx=(6, 6))
         # After picking a style, typing carries on in the open text box.
         self.family_box.bind("<<ComboboxSelected>>", self._refocus_entry)
@@ -869,6 +894,12 @@ class EditorWindow:
         return TextStyle(family=self.family_var.get(), size=size,
                          bold=self.bold_var.get(), italic=self.italic_var.get(),
                          color=self.text_color)
+
+    def _fill_families(self) -> None:
+        """The standard fonts first, then every installed font family."""
+        installed = [f for f in fontmatch.default_index().families()
+                     if f not in FAMILIES]
+        self.family_box.configure(values=list(FAMILIES) + installed)
 
     def _on_style_change(self) -> None:
         if self.view.adding_at is not None:
@@ -1339,6 +1370,9 @@ class EditorApp:
         self.root.withdraw()
         self.windows: List[EditorWindow] = []
         self._quitting = False
+        # Find the installed fonts now, so the first edit that needs one
+        # doesn't wait (a second or so the very first time; cached after).
+        fontmatch.default_index().load_in_background()
         # Finder "Open With", double-clicking a PDF and dropping PDFs on the
         # Dock icon deliver files through this Apple Event, not argv.
         self.root.createcommand("::tk::mac::OpenDocument", self.open_paths)

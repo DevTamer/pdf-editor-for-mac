@@ -853,3 +853,37 @@ def test_new_windows_cascade_instead_of_stacking(editor_app, tmp_path):
     editor_app.windows[1]._on_close_window()
     editor_app.new_window()          # reuses the free spot
     assert sorted(w.cascade_step for w in editor_app.windows) == [0, 1, 2]
+
+
+# -- Installed fonts ------------------------------------------------------------------
+
+def test_add_text_font_menu_lists_installed_fonts(app, installed_fonts):
+    installed_fonts("Supplemental/Georgia.ttf", "Helvetica.ttc")
+    app._fill_families()
+    values = list(app.window.tk.splitlist(app.family_box.cget("values")))
+    assert values[:3] == ["Helvetica", "Times", "Courier"]
+    assert "Georgia" in values and values.count("Helvetica") == 1
+
+
+def test_text_box_is_shown_in_the_matched_installed_font(app, installed_fonts):
+    installed_fonts("Supplemental/Georgia.ttf")
+    run = next(r for r in app.model.runs(0) if r.text.strip() == TARGET)
+    assert app.model.display_family(run) is None        # Helvetica isn't installed
+    installed_fonts("Helvetica.ttc")
+    assert app.model.display_family(run) == "Helvetica"
+    # A family Tk doesn't know falls back to the run's generic look.
+    assert app.view.screen_family("No Such Family", run) == "Helvetica"
+    assert app.view.screen_family("Georgia") == "Georgia"
+
+
+def test_adding_text_in_an_installed_font(app, installed_fonts):
+    installed_fonts("Supplemental/Georgia.ttf")
+    app.set_tool("add")
+    app.family_var.set("Georgia")
+    app.view._on_click(_Event(60 * SCALE, 300 * SCALE))
+    _type(app, "In Georgia")
+    _press(app, "<Return>")
+    assert "In Georgia" in _page_text(app)
+    fonts = {s["font"] for b in app.model.get_page(0).get_text("dict")["blocks"]
+             if b["type"] == 0 for line in b["lines"] for s in line["spans"]}
+    assert "Georgia" in fonts

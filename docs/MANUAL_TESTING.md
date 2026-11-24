@@ -53,8 +53,14 @@ Use a few real PDFs:
 - [ ] Clicking another line applies the current edit and starts editing the
       clicked line.
 - [ ] Clearing the box and pressing Return deletes the line.
-- [ ] Typing a character the font doesn't have shows the substitution
-      warning. Cancel keeps the box open; OK applies.
+- [ ] In a PDF from Word (Arial, Calibri, Times New Roman), typing
+      characters the document never used gives no warning, and they look
+      like the rest of the line (same font, from this Mac or Word).
+- [ ] In a PDF whose font isn't installed (e.g. one using Georgia, after
+      disabling Georgia in Font Book), the warning names a sensible
+      lookalike, and the result looks close. Cancel keeps the box open; OK
+      applies.
+- [ ] The text box you type in shows a font that looks like the line's.
 - [ ] A much longer replacement next to other text warns about the overlap.
 - [ ] Typing e.g. 漢字 shows an error and keeps the box open.
 - [ ] Edit the same line twice in a row. The second edit shouldn't warn
@@ -87,6 +93,9 @@ Use a few real PDFs:
 - [ ] Return adds the text with its top-left where you clicked. Clicking
       somewhere else adds it and opens a new box.
 - [ ] Bold, Italic and Colour… all show up in the added text.
+- [ ] The Font menu lists installed fonts after Helvetica, Times and
+      Courier. Text added in one of them looks right in Preview, and the
+      file grows by only a few KB.
 - [ ] Added text can be edited afterwards with the Edit tool, with no font
       warning.
 - [ ] Typing e.g. 漢字 shows an error and keeps the box open.

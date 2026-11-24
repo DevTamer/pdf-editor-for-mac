@@ -32,7 +32,7 @@ Then pick a tool from the toolbar or the **Tools** menu:
 | Tool | Shortcut | What you do |
 |---|---|---|
 | ✎ **Edit Text** | `Cmd+1` | Hover: editable text gets a dashed blue outline. Click it, type, then press **Return** to apply or **Esc** to cancel. Clicking elsewhere also applies. Clearing the box deletes the text. |
-| + **Add Text** | `Cmd+2` | Click where the new text should start and type. Choose the font (Helvetica, Times, Courier), size, bold, italic and colour in the sidebar. Return adds it. |
+| + **Add Text** | `Cmd+2` | Click where the new text should start and type. Choose the font (any installed font, or the standard Helvetica, Times and Courier), size, bold, italic and colour in the sidebar. Return adds it. |
 | ⌫ **Erase** | `Cmd+3` | Click a word to erase it. Drag from one word to another to erase everything between them, like selecting text. Drag from empty space to erase everything in a rectangle. |
 
 Return and Esc apply or cancel the text box wherever you last clicked in the
@@ -70,19 +70,47 @@ changes in each window first.
 ### Fonts, and when you'll see a warning
 
 PDFs usually embed only a *subset* of each font: just the characters the
-document already uses. If you type a character the PDF's copy of the font
-doesn't have, the app draws that character with the closest standard font
-(Helvetica, Times or Courier, matching bold/italic) and asks you first:
+document already uses. When you type a character the PDF's copy of the
+font doesn't have, the app looks for it, in this order:
 
-> These characters can't be drawn with the PDF's copy of
-> "TimesNewRomanPS-BoldMT" (PDFs usually include only the characters a
-> document already uses), so they'll use Times Bold instead: 9 E R
+1. **The PDF's own font.**
+2. **The same font elsewhere in the PDF.** Some PDFs embed a separate
+   subset of a font on each page.
+3. **The same font, installed on your Mac.** "ArialMT" finds Arial,
+   "TimesNewRomanPS-BoldMT" finds Times New Roman Bold, and Calibri,
+   Cambria or Aptos are found in Microsoft Word if it's installed. This
+   also covers PDFs that name a font without embedding it.
+4. **The closest-looking installed font.** Fonts of the same kind (serif or
+   not, monospaced or not, bold, italic) are compared by x-height, cap
+   height and character widths, and the best two dozen glyph by glyph: the
+   characters the PDF's font has are drawn in both fonts and compared
+   pixel by pixel. Arial finds Helvetica, Times New Roman finds Times,
+   Verdana finds MS Reference Sans Serif, Georgia finds PT Serif or
+   Charter. If the PDF doesn't embed the font at all, the character widths
+   it records are compared instead.
+5. **Helvetica, Times or Courier**, only if nothing else can draw it.
 
-Everything else stays in the original font. You'll also be warned if the
-original font isn't embedded at all, or if longer text would run into the
-text that follows it on the same line. Characters that no available font
-can draw, such as most non-Latin scripts for now, are refused rather than
-written as blank boxes.
+Steps 1 to 3 are the same typeface, so there's no warning. Steps 4 and 5
+are a lookalike, and you're asked first:
+
+> These characters can't be drawn with the PDF's copy of "Georgia" (PDFs
+> usually include only the characters a document already uses), and it
+> isn't installed on this Mac, so they'll use PT Serif, the closest match:
+> 9 E R
+
+An installed font is never embedded whole, only the characters you typed,
+so the file grows by a few KB. Fonts whose licence forbids embedding are
+never used. Installed fonts are scanned once, in the background at launch
+(about a second), and remembered afterwards.
+
+The text box you type in also shows the matched font, when macOS can
+display it (fonts inside Word's app bundle can't be, so a lookalike is
+shown while typing).
+
+You'll also be warned if longer text would run into the text that follows
+it on the same line. Characters that no available font can draw, such as
+most non-Latin scripts for now, are refused rather than written as blank
+boxes.
 
 ## How an edit works
 
@@ -131,9 +159,8 @@ The details are in the docstring at the top of [`textedit.py`](textedit.py).
 - **Drawing order.** Edited and added text is drawn on top of the page's
   other content. If a shape used to be drawn *over* that text (a highlight,
   a strike-through line), the text now sits above it.
-- **Standard fonts for new and substitute characters.** Added text, and any
-  character missing from a PDF's embedded font, uses Helvetica, Times or
-  Courier.
+- **Variable fonts aren't used yet.** SF Pro, New York and other variable
+  fonts are skipped when matching, so text in them gets a lookalike.
 - **Erasing shapes covers them.** Vector graphics in an erased rectangle are
   covered with a fill rather than removed from the file. Some images are
   also covered with a fill rather than edited, and their original pixels
@@ -178,11 +205,15 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The suite has five parts:
+The suite has six parts:
 
 - `test_erase.py` covers erasing: selections, fills (including paper grain),
   text removal, in-place scan edits (JPEG and 1-bit stay compact), and
   covering leftover shapes.
+- `test_fontmatch.py` covers font matching: names, the font index and its
+  cache, licences, lookalikes and editing with installed fonts. It uses
+  real macOS fonts, made "installed" one at a time so results don't
+  depend on the machine.
 - `test_textedit.py` covers the editing and add-text engine. It runs headless, on
   generated PDFs plus one real-world PDF made by macOS's own text system
   (`tests/fixtures/coretext_sample.pdf`, regenerated with
@@ -227,6 +258,9 @@ the test suite there, then builds `packaging/dist/PDF Editor.app` and
 - [`textedit.py`](textedit.py) is the editing and add-text engine, with no
   Tk. It finds text runs, picks fonts, plans an edit (warnings and errors
   included) and applies it with verification.
+- [`fontmatch.py`](fontmatch.py) finds installed fonts: the same font by
+  name, or the closest-looking one, and embeds just the characters needed.
+  No Tk.
 - [`erase.py`](erase.py) is the erase engine, with no Tk. It handles words
   and selections, removing text character by character, the fills, in-place
   image edits and covering patches.

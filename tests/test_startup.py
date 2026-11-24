@@ -44,3 +44,8 @@ def test_uses_pymupdf_not_the_deprecated_fitz_alias():
     out = _run("import sys, editor; "
                "print('pymupdf' in sys.modules, 'fitz' in sys.modules)")
     assert out == "True False"
+
+
+def test_font_matching_does_not_need_tk():
+    out = _run("import sys, fontmatch; print('tkinter' in sys.modules)")
+    assert out == "False"

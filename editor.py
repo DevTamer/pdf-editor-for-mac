@@ -44,7 +44,8 @@ from textedit import (  # noqa: E402
 # ---------------------------------------------------------------------------
 
 APP_NAME = "PDF Editor"
-DEFAULT_WINDOW_SIZE = "1200x800"
+DEFAULT_WIDTH, DEFAULT_HEIGHT = 1200, 800
+DEFAULT_WINDOW_SIZE = f"{DEFAULT_WIDTH}x{DEFAULT_HEIGHT}"
 MIN_WINDOW_WIDTH = 900
 MIN_WINDOW_HEIGHT = 600
 SIDEBAR_WIDTH = 280
@@ -533,17 +534,23 @@ class EditCanvas(PageView):
 
 
 # ---------------------------------------------------------------------------
-# EditorApp — main window
+# EditorWindow — one window per open PDF
 # ---------------------------------------------------------------------------
 
-class EditorApp:
-    """Main PDF Editor window."""
+class EditorWindow:
+    """A document window: one PDF, its tools, sidebar and history.
 
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title(APP_NAME)
-        self.root.geometry(DEFAULT_WINDOW_SIZE)
-        self.root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
+    Windows are created by EditorApp, which opens each PDF in its own
+    window (like Preview) and handles quitting.
+    """
+
+    def __init__(self, app: "EditorApp", geometry: str = DEFAULT_WINDOW_SIZE):
+        self.app = app
+        self.cascade_step = 0
+        self.window = tk.Toplevel(app.root)
+        self.window.title(APP_NAME)
+        self.window.geometry(geometry)
+        self.window.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
 
         self.model = EditorModel()
         self.renderer = PDFRenderer()
@@ -569,35 +576,58 @@ class EditorApp:
         self._resize_job = None
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
-        self.root.bind("<Command-o>", lambda e: self._on_open())
-        self.root.bind("<Command-s>", lambda e: self._on_save())
-        self.root.bind("<Command-Shift-s>", lambda e: self._on_save_as())
-        self.root.bind("<Command-Shift-S>", lambda e: self._on_save_as())
-        self.root.bind("<Command-w>", lambda e: self._on_close_doc())
-        self.root.bind("<Command-z>", lambda e: self._shortcut(self._on_undo))
-        self.root.bind("<Command-Shift-z>", lambda e: self._shortcut(self._on_redo))
-        self.root.bind("<Command-Shift-Z>", lambda e: self._shortcut(self._on_redo))
+        win = self.window
+        win.bind("<Command-o>", lambda e: self._on_open())
+        win.bind("<Command-s>", lambda e: self._on_save())
+        win.bind("<Command-Shift-s>", lambda e: self._on_save_as())
+        win.bind("<Command-Shift-S>", lambda e: self._on_save_as())
+        win.bind("<Command-w>", lambda e: self._on_close_doc())
+        win.bind("<Command-z>", lambda e: self._shortcut(self._on_undo))
+        win.bind("<Command-Shift-z>", lambda e: self._shortcut(self._on_redo))
+        win.bind("<Command-Shift-Z>", lambda e: self._shortcut(self._on_redo))
         for number, tool in enumerate(TOOLS, start=1):
-            self.root.bind(f"<Command-Key-{number}>",
-                           lambda e, t=tool: self.set_tool(t))
-        self.root.protocol("WM_DELETE_WINDOW", self._on_quit)
-        # Finder "Open With" / double-clicking a PDF delivers files through
-        # this Apple Event hook rather than argv.
-        self.root.createcommand("::tk::mac::OpenDocument", self._on_open_documents)
+            win.bind(f"<Command-Key-{number}>",
+                     lambda e, t=tool: self.set_tool(t))
+        # Return and Esc apply or cancel the open text box wherever the
+        # keyboard focus is in this window. Clicking a button, checkbox or
+        # the History list moves the focus off the box, and Return would
+        # otherwise do nothing. Text fields with their own Return (Go to
+        # page, the size box) handle it and stop it reaching these.
+        win.bind("<Return>", self._on_return_key)
+        win.bind("<KP_Enter>", self._on_return_key)
+        win.bind("<Escape>", self._on_escape_key)
+        win.protocol("WM_DELETE_WINDOW", self._on_close_window)
 
         self._show_tool_panel()
         self._update_ui_state()
 
-    def _on_open_documents(self, *paths) -> None:
-        pdfs = [p for p in paths if p.lower().endswith(".pdf")]
-        if pdfs and self._confirm_discard():
-            self.open_path(pdfs[0])
+    # -- Dialogs, attached to this window --------------------------------------
+
+    def _show_error(self, title: str, message: str) -> None:
+        messagebox.showerror(title, message, parent=self.window)
+
+    def _show_warning(self, title: str, message: str) -> None:
+        messagebox.showwarning(title, message, parent=self.window)
+
+    # -- Keyboard ---------------------------------------------------------------
+
+    def _on_return_key(self, event=None) -> Optional[str]:
+        if self.view.entry is None:
+            return None
+        self._commit_inline_edit()
+        return "break"
+
+    def _on_escape_key(self, event=None) -> Optional[str]:
+        if self.view.entry is None:
+            return None
+        self._cancel_inline_edit()
+        return "break"
 
     # -- Menu / toolbar / layout -----------------------------------------------
 
     def _build_menu(self) -> None:
-        menubar = tk.Menu(self.root)
-        self.root.config(menu=menubar)
+        menubar = tk.Menu(self.window)
+        self.window.config(menu=menubar)
 
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -608,7 +638,7 @@ class EditorApp:
         file_menu.add_command(label="Save As...", command=self._on_save_as,
                               accelerator="Cmd+Shift+S")
         file_menu.add_separator()
-        file_menu.add_command(label="Close Document", command=self._on_close_doc,
+        file_menu.add_command(label="Close", command=self._on_close_doc,
                               accelerator="Cmd+W")
         self.file_menu = file_menu
 
@@ -629,7 +659,7 @@ class EditorApp:
                                        command=lambda t=tool: self.set_tool(t))
 
     def _build_toolbar(self) -> None:
-        toolbar = ttk.Frame(self.root, padding=(5, 3))
+        toolbar = ttk.Frame(self.window, padding=(5, 3))
         toolbar.pack(side="top", fill="x")
 
         ttk.Button(toolbar, text="Open", command=self._on_open,
@@ -667,9 +697,10 @@ class EditorApp:
         self.page_entry = ttk.Entry(toolbar, width=5)
         self.page_entry.pack(side="left", padx=(0, 3))
         self.page_entry.bind("<Return>", self._on_page_jump)
+        self.page_entry.bind("<KP_Enter>", self._on_page_jump)
 
     def _build_main_area(self) -> None:
-        main = ttk.PanedWindow(self.root, orient="horizontal")
+        main = ttk.PanedWindow(self.window, orient="horizontal")
         main.pack(fill="both", expand=True, padx=2, pady=2)
 
         canvas_frame = ttk.Frame(main)
@@ -752,16 +783,24 @@ class EditorApp:
                                        values=list(FAMILIES), state="readonly",
                                        width=11)
         self.family_box.pack(side="left", padx=(6, 6))
+        # After picking a style, typing carries on in the open text box.
+        self.family_box.bind("<<ComboboxSelected>>", self._refocus_entry)
         ttk.Label(row, text="Size").pack(side="left")
         self.size_box = ttk.Spinbox(row, textvariable=self.size_var,
                                     from_=MIN_SIZE, to=MAX_SIZE, increment=1,
-                                    width=4)
+                                    width=4, command=self._refocus_entry)
         self.size_box.pack(side="left", padx=(6, 0))
+        # Return in the size box takes you back to the text box (a second
+        # Return then adds the text).
+        self.size_box.bind("<Return>", self._size_entered)
+        self.size_box.bind("<KP_Enter>", self._size_entered)
 
         row = ttk.Frame(frame)
         row.pack(fill="x", pady=2)
-        ttk.Checkbutton(row, text="Bold", variable=self.bold_var).pack(side="left")
-        ttk.Checkbutton(row, text="Italic", variable=self.italic_var).pack(
+        ttk.Checkbutton(row, text="Bold", variable=self.bold_var,
+                        command=self._refocus_entry).pack(side="left")
+        ttk.Checkbutton(row, text="Italic", variable=self.italic_var,
+                        command=self._refocus_entry).pack(
             side="left", padx=(8, 8))
         self.color_swatch = tk.Label(row, width=2, bg=_hex(self.text_color),
                                      relief="solid", bd=1)
@@ -796,7 +835,7 @@ class EditorApp:
         return panel
 
     def _build_status_bar(self) -> None:
-        status_frame = ttk.Frame(self.root, relief="sunken", padding=(5, 2))
+        status_frame = ttk.Frame(self.window, relief="sunken", padding=(5, 2))
         status_frame.pack(side="bottom", fill="x")
         self.status_label = ttk.Label(status_frame,
                                       text="Ready — open a PDF to begin")
@@ -840,13 +879,20 @@ class EditorApp:
 
     def _choose_color(self) -> None:
         _rgb, hex_color = colorchooser.askcolor(color=_hex(self.text_color),
-                                                title="Text Colour")
+                                                title="Text Colour",
+                                                parent=self.window)
         if not hex_color:
+            self._refocus_entry()
             return
         hex_color = hex_color.lstrip("#")
         self.text_color = tuple(int(hex_color[i:i + 2], 16) / 255 for i in (0, 2, 4))
         self.color_swatch.configure(bg=_hex(self.text_color))
         self._on_style_change()
+        self._refocus_entry()
+
+    def _size_entered(self, event=None) -> str:
+        self._refocus_entry()
+        return "break"
 
     # -- UI state -------------------------------------------------------------
 
@@ -870,10 +916,10 @@ class EditorApp:
             self.page_label.config(text=f"Page {p + 1} / {n}")
             name = os.path.basename(self.model.save_path or self.model.file_path)
             dirty = " — edited" if self.model.is_dirty else ""
-            self.root.title(f"{APP_NAME} — {name}{dirty}")
+            self.window.title(f"{APP_NAME} — {name}{dirty}")
         else:
             self.page_label.config(text="No document")
-            self.root.title(APP_NAME)
+            self.window.title(APP_NAME)
 
     def _refresh_page(self) -> None:
         if not self.model.doc:
@@ -891,7 +937,7 @@ class EditorApp:
         self.renderer.invalidate()
         self._refresh_page()
         self._update_history_list()
-        messagebox.showerror(title, str(exc))
+        self._show_error(title, str(exc))
 
     def _set_status(self, text: str) -> None:
         self.status_label.config(text=text)
@@ -946,12 +992,13 @@ class EditorApp:
             self._set_status("No change")
             return True
         if not plan.can_apply:
-            messagebox.showerror("Can't Make This Edit", "\n\n".join(plan.errors))
+            self._show_error("Can't Make This Edit", "\n\n".join(plan.errors))
             self._refocus_entry()
             return False
         if plan.warnings and not messagebox.askokcancel(
                 "Edit Text", "\n\n".join(plan.warnings)
-                + "\n\nApply the edit anyway?", icon="warning"):
+                + "\n\nApply the edit anyway?", icon="warning",
+                parent=self.window):
             self._refocus_entry()
             return False
 
@@ -964,7 +1011,7 @@ class EditorApp:
         self._after_change(label, run.page_num)
         return True
 
-    def _refocus_entry(self) -> None:
+    def _refocus_entry(self, event=None) -> None:
         if self.view.entry is not None:
             self.view.entry.focus_set()
 
@@ -992,7 +1039,7 @@ class EditorApp:
                                         self.current_style())
         if plan.errors:
             # Nothing was changed: let the user fix the text and try again.
-            messagebox.showerror("Can't Add This Text", "\n\n".join(plan.errors))
+            self._show_error("Can't Add This Text", "\n\n".join(plan.errors))
             self._refocus_entry()
             return False
         self.view.end_inline_edit()
@@ -1030,38 +1077,59 @@ class EditorApp:
             return False
         if not self.model.is_dirty:
             return True
+        name = os.path.basename(self.model.save_path or self.model.file_path)
         answer = messagebox.askyesnocancel(
             "Unsaved Changes",
-            "This document has changes that haven't been saved.\n\n"
-            "Save them first?")
+            f"“{name}” has changes that haven't been saved.\n\n"
+            "Save them first?", parent=self.window)
         if answer is None:
             return False
         if answer:
             return self._on_save()
         return True
 
-    def open_path(self, path: str) -> None:
+    @property
+    def is_empty(self) -> bool:
+        """No document open and nothing being typed: a new PDF can open
+        here instead of in a new window."""
+        return self.model.doc is None and self.view.entry is None
+
+    def shows(self, path: str) -> bool:
+        """Whether this window has ``path`` open (or was saved to it)."""
+        target = os.path.realpath(path)
+        return any(p and os.path.realpath(p) == target
+                   for p in (self.model.file_path, self.model.save_path))
+
+    def open_path(self, path: str) -> bool:
+        """Open ``path`` in this window, replacing what's shown (callers
+        check for unsaved changes first). Returns whether it opened."""
         try:
             self.model.open_document(path)
         except Exception as exc:
             # Whatever was open before stays open (see EditorModel).
-            messagebox.showerror("Error", f"Could not open PDF:\n{exc}")
-            return
+            self._show_error("Error", f"Could not open PDF:\n{exc}")
+            return False
         self.renderer.invalidate()
         self._update_history_list()
+        self._scroll_to_top()
         self._refresh_page()
         self.info_label.config(text="Nothing selected", foreground="gray")
         self._set_status(f"Opened {os.path.basename(path)} — click any text "
                          "to edit it")
+        return True
 
     def _on_open(self) -> None:
-        if not self._confirm_discard():
-            return
-        path = filedialog.askopenfilename(
-            title="Open PDF",
+        paths = filedialog.askopenfilenames(
+            title="Open PDF", parent=self.window,
             filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")])
-        if path:
-            self.open_path(path)
+        if paths:
+            # Each PDF gets its own window; this one is used if it's empty.
+            self.app.open_paths(*self.window.tk.splitlist(paths), prefer=self)
+
+    def bring_to_front(self) -> None:
+        self.window.deiconify()
+        self.window.lift()
+        self.window.focus_force()
 
     def _on_save(self) -> bool:
         if not self.model.doc:
@@ -1077,7 +1145,7 @@ class EditorApp:
             return False
         base = os.path.splitext(os.path.basename(self.model.file_path))[0]
         path = filedialog.asksaveasfilename(
-            title="Save Edited PDF", defaultextension=".pdf",
+            title="Save Edited PDF", defaultextension=".pdf", parent=self.window,
             initialfile=f"{base}_edited.pdf",
             initialdir=os.path.dirname(self.model.file_path),
             filetypes=[("PDF files", "*.pdf")])
@@ -1091,13 +1159,18 @@ class EditorApp:
         try:
             self.model.save_document(path)
         except Exception as exc:
-            messagebox.showerror("Error", f"Could not save PDF:\n{exc}")
+            self._show_error("Error", f"Could not save PDF:\n{exc}")
             return False
         self._set_status(f"Saved to {os.path.basename(path)}")
         self._update_ui_state()
         return True
 
     def _on_close_doc(self) -> None:
+        """File → Close (Cmd+W): close this document. Its window closes
+        too, unless it's the only window, which stays open and empty."""
+        if len(self.app.windows) > 1:
+            self._on_close_window()
+            return
         if not self.model.doc or not self._confirm_discard():
             return
         self.model.close_document()
@@ -1108,9 +1181,23 @@ class EditorApp:
         self._set_status("Ready — open a PDF to begin")
         self._update_ui_state()
 
-    def _on_quit(self) -> None:
-        if self._confirm_discard():
-            self.root.destroy()
+    def _on_close_window(self) -> bool:
+        """The window's close button: close the window (the app quits with
+        its last window). Returns False if the user cancelled."""
+        if not self._confirm_discard():
+            return False
+        self.destroy()
+        return True
+
+    def destroy(self) -> None:
+        """Close the window without asking (callers have already asked)."""
+        if self._resize_job:
+            self.window.after_cancel(self._resize_job)
+            self._resize_job = None
+        self.view.cancel_inline_edit()
+        self.model.close_document()
+        self.window.destroy()
+        self.app.window_closed(self)
 
     # -- Page navigation ------------------------------------------------------
 
@@ -1118,7 +1205,14 @@ class EditorApp:
         if self.view.entry is not None and not self._commit_inline_edit():
             return
         self.model.current_page = page
+        self._scroll_to_top()
         self._refresh_page()
+
+    def _scroll_to_top(self) -> None:
+        """A newly shown page or document starts at its top-left, not at
+        wherever the previous one was scrolled to."""
+        self.canvas.xview_moveto(0)
+        self.canvas.yview_moveto(0)
 
     def _prev_page(self) -> None:
         if self.model.doc and self.model.current_page > 0:
@@ -1128,28 +1222,31 @@ class EditorApp:
         if self.model.doc and self.model.current_page < self.model.page_count - 1:
             self._go_to_page(self.model.current_page + 1)
 
-    def _on_page_jump(self, event=None) -> None:
+    def _on_page_jump(self, event=None) -> str:
+        # "break": this Return is handled, so it doesn't also apply an open
+        # text box (see _on_return_key).
         if not self.model.doc:
-            return
+            return "break"
         try:
             page = int(self.page_entry.get()) - 1
         except ValueError:
-            messagebox.showwarning("Invalid Input", "Enter a page number.")
-            return
+            self._show_warning("Invalid Input", "Enter a page number.")
+            return "break"
         if 0 <= page < self.model.page_count:
             self.page_entry.delete(0, "end")
             self._go_to_page(page)
         else:
-            messagebox.showwarning("Invalid Page",
-                                   f"Page must be 1-{self.model.page_count}")
+            self._show_warning("Invalid Page",
+                               f"Page must be 1-{self.model.page_count}")
+        return "break"
 
     def _on_mousewheel(self, event) -> None:
         self.canvas.yview_scroll(-1 * event.delta, "units")
 
     def _on_canvas_configure(self, event) -> None:
         if self._resize_job:
-            self.root.after_cancel(self._resize_job)
-        self._resize_job = self.root.after(200, self._do_resize)
+            self.window.after_cancel(self._resize_job)
+        self._resize_job = self.window.after(200, self._do_resize)
 
     def _do_resize(self) -> None:
         self._resize_job = None
@@ -1178,7 +1275,7 @@ class EditorApp:
         inline text box (the size box, Go to page...). Cmd+Z there must not
         undo document changes."""
         try:
-            focus = self.root.focus_get()
+            focus = self.window.focus_get()
         except (KeyError, tk.TclError):
             return False
         return (isinstance(focus, (tk.Entry, ttk.Entry))
@@ -1219,6 +1316,107 @@ class EditorApp:
             self.history_list.see(self.model.history_index)
         self._update_ui_state()
 
+
+
+# ---------------------------------------------------------------------------
+# EditorApp — the application: its windows, opening files, quitting
+# ---------------------------------------------------------------------------
+
+class EditorApp:
+    """Owns a hidden Tk root and one EditorWindow per open PDF.
+
+    Each PDF opens in its own window, like Preview: opening several at
+    once, or one after another, never replaces a document you're working
+    on. A PDF that's already open just brings its window to the front.
+    Quitting asks about every window's unsaved changes; the app quits when
+    its last window closes.
+    """
+
+    CASCADE = 28  # px each new window is offset from the previous one
+
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.windows: List[EditorWindow] = []
+        self._quitting = False
+        # Finder "Open With", double-clicking a PDF and dropping PDFs on the
+        # Dock icon deliver files through this Apple Event, not argv.
+        self.root.createcommand("::tk::mac::OpenDocument", self.open_paths)
+        # Cmd+Q and PDF Editor → Quit. Without this Tk just exits, without
+        # asking about unsaved changes.
+        self.root.createcommand("::tk::mac::Quit", self.quit)
+        # Clicking the Dock icon when no window is open.
+        self.root.createcommand("::tk::mac::ReopenApplication", self._on_reopen)
+
+    def new_window(self) -> EditorWindow:
+        # Cascade, so a new window never sits exactly on top of another.
+        # (Positions are worked out here, not read back from the windows:
+        # a window that hasn't been drawn yet reports 0, 0.)
+        taken = {w.cascade_step for w in self.windows}
+        step = next(i for i in range(len(taken) + 1) if i not in taken)
+        offset = self.CASCADE * (step % 5)
+        # Leave room on screen to cascade into: macOS pushes a window that
+        # doesn't fit back onto the screen, on top of the previous one.
+        max_w, max_h = self.root.wm_maxsize()
+        room = self.CASCADE * 4
+        width = max(MIN_WINDOW_WIDTH, min(DEFAULT_WIDTH, max_w - 60 - room))
+        height = max(MIN_WINDOW_HEIGHT, min(DEFAULT_HEIGHT, max_h - 40 - room))
+        win = EditorWindow(self, f"{width}x{height}+{60 + offset}+{40 + offset}")
+        win.cascade_step = step
+        self.windows.append(win)
+        return win
+
+    def open_paths(self, *paths, prefer: Optional[EditorWindow] = None) -> None:
+        """Open each PDF in its own window: the one it's already open in,
+        else ``prefer`` or another empty window, else a new one."""
+        for path in paths:
+            if not str(path).lower().endswith(".pdf"):
+                continue
+            existing = next((w for w in self.windows if w.shows(path)), None)
+            if existing is not None:
+                existing.bring_to_front()
+                continue
+            empty = [w for w in self.windows if w.is_empty]
+            if prefer is not None and prefer in empty:
+                win, created = prefer, False
+            elif empty:
+                win, created = empty[0], False
+            else:
+                win, created = self.new_window(), True
+            if not win.open_path(path) and created:
+                win.destroy()   # the error was shown; don't leave a blank window
+            elif win.model.doc is not None:
+                win.bring_to_front()
+
+    def window_closed(self, win: EditorWindow) -> None:
+        if win in self.windows:
+            self.windows.remove(win)
+        if not self.windows and not self._quitting:
+            self._destroy_root()
+
+    def quit(self, *args) -> None:
+        """Ask about each window's unsaved changes, then quit. Cancelling
+        any of them cancels quitting."""
+        for win in list(self.windows):
+            if win.model.is_dirty or win.view.entry is not None:
+                win.bring_to_front()
+            if not win._confirm_discard():
+                return
+        self._quitting = True
+        for win in list(self.windows):
+            win.destroy()
+        self._destroy_root()
+
+    def _on_reopen(self, *args) -> None:
+        if not self.windows:
+            self.new_window()
+
+    def _destroy_root(self) -> None:
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass   # already gone
+
     def run(self) -> None:
         self.root.mainloop()
 
@@ -1227,8 +1425,10 @@ def main(argv: List[str]) -> None:
     # Tight text boxes: better click targets and hover outlines.
     pymupdf.TOOLS.set_small_glyph_heights(True)
     app = EditorApp()
-    if len(argv) > 1 and os.path.isfile(argv[1]):
-        app.root.after(100, lambda: app.open_path(argv[1]))
+    app.new_window()
+    paths = [p for p in argv[1:] if os.path.isfile(p)]
+    if paths:
+        app.root.after(100, lambda: app.open_paths(*paths))
     app.run()
 
 

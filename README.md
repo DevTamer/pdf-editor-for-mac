@@ -21,7 +21,12 @@ Both are built on [pdfcore](https://github.com/DevTamer/pdfcore).
 
 ## Using it
 
-Open a PDF with **File → Open…** (`Cmd+O`), or drop one onto the app icon.
+Open PDFs with **File → Open…** (`Cmd+O`, several at once if you like), or
+drop them onto the app icon. Each PDF gets its own window, like Preview (or
+its own tab, if your Mac is set to prefer tabs), so opening another never
+replaces one you're working on. Opening a PDF that's already open just
+brings its window to the front.
+
 Then pick a tool from the toolbar or the **Tools** menu:
 
 | Tool | Shortcut | What you do |
@@ -30,12 +35,16 @@ Then pick a tool from the toolbar or the **Tools** menu:
 | + **Add Text** | `Cmd+2` | Click where the new text should start and type. Choose the font (Helvetica, Times, Courier), size, bold, italic and colour in the sidebar. Return adds it. |
 | ⌫ **Erase** | `Cmd+3` | Click a word to erase it. Drag from one word to another to erase everything between them, like selecting text. Drag from empty space to erase everything in a rectangle. |
 
-Every change is one step in the **History** panel. Use **Undo/Redo**
+Return and Esc apply or cancel the text box wherever you last clicked in the
+window, so clicking Bold, the colour or the History list first is fine.
+
+Every change is one step in the **History** panel. Each window has its own. Use **Undo/Redo**
 (`Cmd+Z` / `Cmd+Shift+Z`), or click any entry to jump back to it.
 
 **Save** (`Cmd+S`) or **Save As…** (`Cmd+Shift+S`). The first save suggests
 `<name>_edited.pdf`. Your original file is only replaced if you choose to
-save over it.
+save over it. Closing a window, or quitting (`Cmd+Q`), asks about unsaved
+changes in each window first.
 
 ### What erasing leaves behind
 

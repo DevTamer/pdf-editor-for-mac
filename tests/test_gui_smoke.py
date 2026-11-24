@@ -5,6 +5,8 @@ Needs a working Tcl/Tk and a display session; skips itself cleanly when a
 Tk root can't be created.
 """
 
+import os
+
 import pymupdf
 import pytest
 
@@ -29,24 +31,44 @@ def no_real_dialogs(monkeypatch):
     for name in ("showinfo", "showwarning", "showerror", "askyesno",
                  "askyesnocancel", "askokcancel", "askquestion"):
         monkeypatch.setattr(editor.messagebox, name, unexpected(name))
-    for name in ("askopenfilename", "asksaveasfilename"):
+    for name in ("askopenfilename", "askopenfilenames", "asksaveasfilename"):
         monkeypatch.setattr(editor.filedialog, name, unexpected(name))
 
 
 @pytest.fixture
-def app(sample_pdf_path, monkeypatch):
+def editor_app(monkeypatch):
+    """The application, with every window it opens kept off screen."""
     try:
         instance = editor.EditorApp()
     except Exception as exc:
         pytest.skip(f"Tk isn't usable in this environment: {exc}")
-    instance.root.withdraw()
-    # A withdrawn window's canvas reports a width of 1px; pretend it's
-    # 620px so pages fit at 600px wide (SCALE below) on every refresh.
-    monkeypatch.setattr(instance.canvas, "winfo_width", lambda: 620)
-    instance.open_path(str(sample_pdf_path))
+    real_new_window = instance.new_window
+
+    def hidden_window():
+        win = real_new_window()
+        win.window.withdraw()
+        # A withdrawn window's canvas reports a width of 1px; pretend it's
+        # 620px so pages fit at 600px wide (SCALE below) on every refresh.
+        monkeypatch.setattr(win.canvas, "winfo_width", lambda: 620)
+        # Showing a window would put it on screen.
+        monkeypatch.setattr(win, "bring_to_front",
+                            lambda: win.__dict__.__setitem__("fronted", True))
+        return win
+
+    monkeypatch.setattr(instance, "new_window", hidden_window)
     yield instance
-    instance.model.close_document()
-    instance.root.destroy()
+    instance._quitting = True
+    for win in list(instance.windows):
+        win.model.close_document()
+    instance._destroy_root()
+
+
+@pytest.fixture
+def app(editor_app, sample_pdf_path):
+    """One window with the sample PDF open."""
+    instance = editor_app.new_window()
+    assert instance.open_path(str(sample_pdf_path))
+    return instance
 
 
 SCALE = 600 / PAGE_WIDTH  # canvas px per PDF point at fit_width=600
@@ -131,7 +153,7 @@ def test_return_applies_the_edit(app):
     assert TARGET not in _page_text(app)
     assert app.history_list.size() == 2
     assert "Edit “Target line to edit”" in app.status_label["text"]
-    assert app.root.title().endswith("— edited")
+    assert app.window.title().endswith("— edited")
     assert str(app.undo_btn["state"]) == "normal"
 
 
@@ -191,7 +213,7 @@ def test_warning_can_be_declined_or_accepted(app, monkeypatch):
 def test_error_keeps_the_editor_open(app, monkeypatch):
     shown = []
     monkeypatch.setattr(editor.messagebox, "showerror",
-                        lambda title, message: shown.append(message))
+                        lambda title, message, **k: shown.append(message))
     _click(app, TARGET)
     _type(app, "漢字")
     app._commit_inline_edit()
@@ -204,7 +226,7 @@ def test_error_keeps_the_editor_open(app, monkeypatch):
 def test_editor_matches_the_text_size_on_screen(app):
     _click(app, TITLE)  # 20pt
     font = app.view.entry.cget("font")
-    size_px = abs(int(app.root.tk.call("font", "actual", font, "-size")))
+    size_px = abs(int(app.window.tk.call("font", "actual", font, "-size")))
     assert size_px == pytest.approx(20 * SCALE, abs=1.5)
 
 
@@ -266,8 +288,8 @@ def test_save_as_writes_file_and_clears_dirty(app, tmp_path, monkeypatch):
     assert "Saved edit" in saved[0].get_text()
     saved.close()
     assert not app.model.is_dirty
-    assert "— edited" not in app.root.title()
-    assert app.root.title().endswith("saved.pdf")
+    assert "— edited" not in app.window.title()
+    assert app.window.title().endswith("saved.pdf")
 
     # Plain Save now goes to the same file without asking.
     monkeypatch.setattr(editor.filedialog, "asksaveasfilename",
@@ -281,8 +303,11 @@ def test_save_as_writes_file_and_clears_dirty(app, tmp_path, monkeypatch):
     saved.close()
 
 
-def test_open_documents_apple_event(app, sample_pdf_path):
-    app._on_open_documents(str(sample_pdf_path), "/tmp/not-a-pdf.txt")
+def test_open_documents_apple_event_reuses_the_window(app, editor_app,
+                                                     sample_pdf_path):
+    # Finder opening a PDF that's already open just brings its window up.
+    editor_app.open_paths(str(sample_pdf_path), "/tmp/not-a-pdf.txt")
+    assert editor_app.windows == [app]
     assert app.model.file_path == str(sample_pdf_path)
 
 
@@ -310,14 +335,14 @@ def test_password_protected_pdf_shows_an_error(app, tmp_path, monkeypatch):
     doc.close()
     shown = []
     monkeypatch.setattr(editor.messagebox, "showerror",
-                        lambda title, message: shown.append(message))
+                        lambda title, message, **k: shown.append(message))
 
     app.open_path(str(path))
 
     assert shown and "password-protected" in shown[0]
     # The document that was already open is still open and shown.
     assert app.model.file_path.endswith("sample.pdf")
-    assert app.root.title().endswith("sample.pdf")
+    assert app.window.title().endswith("sample.pdf")
     assert app.canvas.find_withtag("page_image")
 
 
@@ -398,7 +423,7 @@ def test_style_change_restyles_the_open_box(app):
     app.set_tool("add")
     app.view._on_click(_Event(60 * SCALE, 300 * SCALE))
     app.size_var.set("30")
-    size_px = abs(int(app.root.tk.call("font", "actual",
+    size_px = abs(int(app.window.tk.call("font", "actual",
                                        app.view.entry.cget("font"), "-size")))
     assert size_px == pytest.approx(30 * SCALE, abs=1.5)
 
@@ -406,7 +431,7 @@ def test_style_change_restyles_the_open_box(app):
 def test_add_text_error_keeps_the_box_open(app, monkeypatch):
     shown = []
     monkeypatch.setattr(editor.messagebox, "showerror",
-                        lambda title, message: shown.append(message))
+                        lambda title, message, **k: shown.append(message))
     app.set_tool("add")
     app.view._on_click(_Event(60 * SCALE, 300 * SCALE))
     _type(app, "漢字")
@@ -490,7 +515,7 @@ def test_tiny_drag_on_empty_space_does_nothing(app):
 def test_erasing_empty_area_shows_a_message(app, monkeypatch):
     shown = []
     monkeypatch.setattr(editor.messagebox, "showerror",
-                        lambda title, message: shown.append(message))
+                        lambda title, message, **k: shown.append(message))
     app.set_tool("erase")
     _press_move_release(app, (300 * SCALE, 400 * SCALE), (400 * SCALE, 450 * SCALE))
     assert shown and "nothing to erase" in shown[0]
@@ -521,7 +546,7 @@ def test_nonsense_size_does_not_leak_add_state_into_edits(app, monkeypatch):
     the add state behind, so the next *edit* was applied as an added line."""
     shown = []
     monkeypatch.setattr(editor.messagebox, "showerror",
-                        lambda title, message: shown.append(message))
+                        lambda title, message, **k: shown.append(message))
     app.set_tool("add")
     app.size_var.set("nan")
     app.view._on_click(_Event(60 * SCALE, 300 * SCALE))
@@ -581,7 +606,7 @@ def test_undo_shortcut_leaves_other_text_fields_alone(app, monkeypatch):
     _click(app, TARGET)
     _type(app, "Edited")
     _press(app, "<Return>")
-    monkeypatch.setattr(app.root, "focus_get", lambda: app.size_box)
+    monkeypatch.setattr(app.window, "focus_get", lambda: app.size_box)
     app._shortcut(app._on_undo)                    # Cmd+Z typed in the size box
     assert "Edited" in _page_text(app)
     app._on_undo()                                 # the Undo button still works
@@ -619,3 +644,212 @@ def test_redisplaying_the_page_closes_any_open_box(app):
     app.view.display_page(0)
     assert app.view.entry is None and app.view.editing_run is None
     assert app.canvas.find_withtag("editor") == ()
+
+
+# -- Return and Esc wherever the focus is -------------------------------------------
+
+def test_return_anywhere_in_the_window_applies_the_box(app):
+    """Clicking a button, checkbox or the History list takes the keyboard
+    focus off the text box; Return must still apply it."""
+    assert "_on_return_key" in app.window.bind("<Return>")
+    assert "_on_return_key" in app.window.bind("<KP_Enter>")
+    _click(app, TARGET)
+    _type(app, "Applied from elsewhere")
+    assert app._on_return_key() == "break"
+    assert app.view.entry is None
+    assert "Applied from elsewhere" in _page_text(app)
+
+
+def test_return_anywhere_does_nothing_without_a_box(app):
+    assert app._on_return_key() is None
+    assert app.history_list.size() == 1
+
+
+def test_escape_anywhere_in_the_window_cancels_the_box(app):
+    assert "_on_escape_key" in app.window.bind("<Escape>")
+    _click(app, TARGET)
+    _type(app, "Never applied")
+    assert app._on_escape_key() == "break"
+    assert app.view.entry is None
+    assert TARGET in _page_text(app)
+
+
+def test_return_in_go_to_page_doesnt_apply_the_box(app):
+    _click(app, TARGET)
+    _type(app, "Applied by paging")
+    app.page_entry.insert(0, "2")
+    # Go to page handles its own Return and stops it there...
+    assert app._on_page_jump() == "break"
+    assert app.model.current_page == 1     # (paging applies the box anyway)
+    app.page_entry.insert(0, "abc")
+    warned = []
+    app._show_warning = lambda *a: warned.append(a)
+    assert app._on_page_jump() == "break"
+    assert warned
+
+
+def test_return_in_the_size_box_goes_back_to_the_text_box(app, monkeypatch):
+    app.set_tool("add")
+    app.view._on_click(_Event(60 * SCALE, 300 * SCALE))
+    _type(app, "Not yet")
+    refocused = []
+    monkeypatch.setattr(app, "_refocus_entry", lambda: refocused.append(1))
+    assert "_size_entered" in app.size_box.bind("<Return>")
+    assert app._size_entered() == "break"
+    assert refocused and app.view.entry is not None   # not added yet
+    assert app.history_list.size() == 1
+
+
+def test_style_controls_hand_typing_back_to_the_box(app):
+    app.set_tool("add")
+    app.view._on_click(_Event(60 * SCALE, 300 * SCALE))
+    for widget in (app.size_box,):
+        assert "_refocus_entry" in str(widget.cget("command"))
+    boxes = [w for w in _descendants(app.tool_panels["add"])
+             if isinstance(w, editor.ttk.Checkbutton)]
+    assert len(boxes) == 2
+    for box in boxes:
+        assert "_refocus_entry" in str(box.cget("command"))
+    assert "_refocus_entry" in app.family_box.bind("<<ComboboxSelected>>")
+
+
+def _descendants(widget):
+    for child in widget.winfo_children():
+        yield child
+        yield from _descendants(child)
+
+
+# -- One window per PDF ---------------------------------------------------------------
+
+def _other_pdf(tmp_path, name, text):
+    path = tmp_path / name
+    doc = pymupdf.open()
+    doc.new_page().insert_text((72, 72), text, fontsize=14)
+    doc.save(str(path))
+    doc.close()
+    return str(path)
+
+
+def test_opening_several_pdfs_gives_each_its_own_window(app, editor_app, tmp_path):
+    _click(app, TARGET)
+    _type(app, "Unsaved work")
+    _press(app, "<Return>")
+    b = _other_pdf(tmp_path, "b.pdf", "Document B")
+    c = _other_pdf(tmp_path, "c.pdf", "Document C")
+
+    editor_app.open_paths(b, c)
+
+    assert len(editor_app.windows) == 3
+    assert "Unsaved work" in _page_text(app)              # untouched
+    assert app.model.is_dirty
+    titles = [w.window.title() for w in editor_app.windows]
+    assert titles[1].endswith("b.pdf") and titles[2].endswith("c.pdf")
+    assert "Document C" in editor_app.windows[2].model.get_page(0).get_text()
+    # Each window has its own history.
+    assert editor_app.windows[1].history_list.size() == 1
+
+
+def test_open_dialog_takes_several_files_and_fills_an_empty_window_first(
+        editor_app, tmp_path, monkeypatch):
+    empty = editor_app.new_window()
+    b = _other_pdf(tmp_path, "b.pdf", "Document B")
+    c = _other_pdf(tmp_path, "c.pdf", "Document C")
+    monkeypatch.setattr(editor.filedialog, "askopenfilenames",
+                        lambda **k: (b, c))
+    empty._on_open()
+    assert len(editor_app.windows) == 2
+    assert empty.model.file_path == b
+    assert editor_app.windows[1].model.file_path == c
+
+
+def test_opening_one_after_another_never_replaces_a_document(app, editor_app,
+                                                             tmp_path, monkeypatch):
+    for name in ("b.pdf", "c.pdf", "d.pdf"):
+        path = _other_pdf(tmp_path, name, name)
+        monkeypatch.setattr(editor.filedialog, "askopenfilenames",
+                            lambda **k: (path,))
+        editor_app.windows[-1]._on_open()
+    assert [os.path.basename(w.model.file_path) for w in editor_app.windows] == \
+        ["sample.pdf", "b.pdf", "c.pdf", "d.pdf"]
+
+
+def test_opening_an_open_pdf_brings_its_window_forward(app, editor_app,
+                                                       sample_pdf_path, tmp_path):
+    b = _other_pdf(tmp_path, "b.pdf", "Document B")
+    editor_app.open_paths(b)
+    editor_app.open_paths(str(sample_pdf_path))
+    assert len(editor_app.windows) == 2
+    assert app.__dict__.get("fronted")
+
+
+def test_a_pdf_that_wont_open_leaves_no_blank_window(app, editor_app, tmp_path,
+                                                     monkeypatch):
+    bad = tmp_path / "broken.pdf"
+    bad.write_bytes(b"not a pdf")
+    shown = []
+    monkeypatch.setattr(editor.messagebox, "showerror",
+                        lambda title, message, **k: shown.append(message))
+    editor_app.open_paths(str(bad))
+    assert shown
+    assert editor_app.windows == [app]
+
+
+def test_close_with_other_windows_open_closes_the_window(app, editor_app, tmp_path):
+    editor_app.open_paths(_other_pdf(tmp_path, "b.pdf", "B"))
+    second = editor_app.windows[1]
+    second._on_close_doc()
+    assert editor_app.windows == [app]
+    # The last window stays open, empty, on Close.
+    app._on_close_doc()
+    assert editor_app.windows == [app] and app.model.doc is None
+
+
+def test_closing_the_last_window_quits(editor_app, app):
+    app._on_close_window()
+    assert editor_app.windows == []
+    with pytest.raises(editor.tk.TclError):
+        editor_app.root.winfo_exists()
+
+
+def test_quit_asks_about_each_unsaved_window_and_can_be_cancelled(
+        app, editor_app, tmp_path, monkeypatch):
+    editor_app.open_paths(_other_pdf(tmp_path, "b.pdf", "Document B"))
+    second = editor_app.windows[1]
+    _click(app, TARGET)
+    _type(app, "Unsaved")
+    _press(app, "<Return>")
+    asked = []
+    monkeypatch.setattr(editor.messagebox, "askyesnocancel",
+                        lambda title, message, **k: asked.append(message))  # None = cancel
+    editor_app.quit()
+    assert len(asked) == 1 and "sample.pdf" in asked[0]
+    assert editor_app.windows == [app, second]     # still running
+    assert editor_app.root.winfo_exists()
+
+    monkeypatch.setattr(editor.messagebox, "askyesnocancel",
+                        lambda *a, **k: False)     # don't save
+    editor_app.quit()
+    assert editor_app.windows == []
+
+
+def test_quit_and_open_apple_events_are_handled(editor_app):
+    commands = editor_app.root.tk.call("info", "commands", "::tk::mac::*")
+    names = set(editor_app.root.tk.splitlist(commands))
+    assert {"::tk::mac::Quit", "::tk::mac::OpenDocument",
+            "::tk::mac::ReopenApplication"} <= names
+
+
+def test_a_new_page_starts_scrolled_to_the_top(app):
+    app.canvas.configure(height=100)
+    app.canvas.yview_moveto(0.5)
+    app._next_page()
+    assert app.canvas.yview()[0] == 0.0
+
+
+def test_new_windows_cascade_instead_of_stacking(editor_app, tmp_path):
+    editor_app.open_paths(*(_other_pdf(tmp_path, f"{n}.pdf", n) for n in "abc"))
+    steps = [w.cascade_step for w in editor_app.windows]
+    assert steps == [0, 1, 2]
+    editor_app.windows[1]._on_close_window()
+    editor_app.new_window()          # reuses the free spot
+    assert sorted(w.cascade_step for w in editor_app.windows) == [0, 1, 2]

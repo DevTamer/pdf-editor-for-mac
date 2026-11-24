@@ -21,6 +21,17 @@ Use a few real PDFs:
 - [ ] Double-clicking a PDF that's set to open with PDF Editor, or dropping
       it on the Dock icon, opens it.
 - [ ] Resizing the window re-fits the page.
+- [ ] Opening a second PDF (File → Open, or from Finder) opens it in a new
+      window or tab and leaves the first one as it was, unsaved edits
+      included. Selecting several PDFs in File → Open, or dropping several
+      on the Dock icon, opens all of them.
+- [ ] Opening a PDF that's already open just brings its window forward.
+- [ ] Cmd+W closes a window. With only one window left, it closes the
+      document and keeps the empty window.
+- [ ] Cmd+Q with unsaved edits in two windows asks about each. Cancel
+      really cancels quitting.
+- [ ] Going to the next page shows its top, not wherever the last page was
+      scrolled to.
 
 ## Hover and click
 
@@ -35,6 +46,10 @@ Use a few real PDFs:
 - [ ] Change a word and press Return. It's replaced in the same font, size,
       colour and position, and nothing else on the page moves.
 - [ ] Esc cancels with no change.
+- [ ] Click into the box, then click a toolbar button, Bold or the History
+      list, then press Return: the edit is still applied. Esc still
+      cancels.
+- [ ] Switch to another app and back, then press Return: applied.
 - [ ] Clicking another line applies the current edit and starts editing the
       clicked line.
 - [ ] Clearing the box and pressing Return deletes the line.

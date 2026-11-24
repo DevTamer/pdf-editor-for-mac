@@ -7,6 +7,7 @@ has installed.
 """
 
 import io
+import json
 
 import pymupdf
 import pytest
@@ -364,3 +365,251 @@ def test_index_rereads_a_font_file_that_changed(tmp_path):
     target.write_bytes((SUPPLEMENTAL / "Georgia.ttf").read_bytes())
     assert [f.family for f in fontmatch.FontIndex(
         dirs=(str(fonts),), cache_path=str(cache)).faces()] == ["Georgia"]
+
+
+# -- Review findings ------------------------------------------------------------------
+
+def _install_many(tmp_path_factory, skip=()):
+    """Make every font in /System/Library/Fonts/Supplemental (plus
+    Helvetica) "installed", except families starting with ``skip``: more
+    candidates than the shortlist, like a real Mac."""
+    directory = tmp_path_factory.mktemp("many-fonts")
+    for source in list(SUPPLEMENTAL.iterdir()) + [SYSTEM_FONTS / HELVETICA]:
+        if source.suffix.lower() in (".ttf", ".otf", ".ttc") and not any(
+                source.name.lower().startswith(s) for s in skip):
+            (directory / source.name).symlink_to(source)
+    fontmatch.set_default_index(fontmatch.FontIndex(dirs=(str(directory),),
+                                                    cache_path=None))
+    te._SIMILAR_CACHE.clear()
+    assert len(fontmatch.default_index().usable_faces()) > fontmatch.SHORTLIST
+
+
+def test_shortlist_keeps_the_best_candidates_among_many(tmp_path_factory):
+    _install_many(tmp_path_factory)
+    assert _closest(SUPPLEMENTAL / "Times New Roman.ttf",
+                    "Quarterly report for members")[0] == "Times New Roman"
+
+
+def test_arial_finds_helvetica_among_many(tmp_path_factory):
+    _install_many(tmp_path_factory, skip=("arial",))
+    ranked = _closest(SUPPLEMENTAL / "Arial.ttf", "Invoice total due 2024")
+    # Microsoft Sans Serif is drawn on Arial's metrics: as good an answer.
+    assert ranked[0] in ("Helvetica", "Microsoft Sans Serif")
+    assert "Helvetica" in ranked
+
+
+def test_reference_heights_come_from_the_glyphs():
+    ref = fontmatch.Reference(
+        font=pymupdf.Font(fontbuffer=_subset_bytes(SUPPLEMENTAL / "Arial.ttf", "xHello")),
+        chars="xHello")
+    x_height, cap = fontmatch._reference_heights(ref)
+    assert x_height == pytest.approx(0.519, abs=0.02)
+    assert cap == pytest.approx(0.716, abs=0.02)
+
+
+def test_lookalikes_for_regular_text_are_all_regular_weight(tmp_path_factory):
+    _install_many(tmp_path_factory, skip=("arial",))
+    ref = fontmatch.Reference(font=pymupdf.Font(fontfile=str(SUPPLEMENTAL / "Arial.ttf")),
+                              chars="Invoice total due 2024")
+    ranked = fontmatch.closest_faces(ref, fontmatch.default_index(), limit=50)
+    assert ranked and all(abs(face.weight - 400) <= fontmatch.WEIGHT_TOLERANCE
+                          for _d, face in ranked)
+
+
+def test_a_sans_name_rules_out_serif_lookalikes(installed_fonts, monkeypatch):
+    installed_fonts(HELVETICA)
+    doc = _pdf_with(SUPPLEMENTAL / "Verdana.ttf", "Invoice total due")
+    run = te.page_runs(doc[0], 0)[0]
+    seen = []
+    monkeypatch.setattr(fontmatch, "closest_faces",
+                        lambda ref, index, limit=1: seen.append(ref) or [])
+    te.similar_face(doc, doc[0], run)
+    assert seen[0].serif is False
+
+
+def test_heights_are_measured_from_the_glyphs():
+    arial = pymupdf.Font(fontfile=str(SUPPLEMENTAL / "Arial.ttf"))
+    assert fontmatch.ink_height(arial, "x") == pytest.approx(0.519, abs=0.02)
+    assert fontmatch.ink_height(arial, "H") == pytest.approx(0.716, abs=0.02)
+
+
+def test_regular_text_doesnt_get_a_bold_lookalike(tmp_path_factory):
+    _install_many(tmp_path_factory, skip=("courier new",))
+    ref = fontmatch.Reference(
+        font=pymupdf.Font(fontfile=str(SUPPLEMENTAL / "Courier New.ttf")),
+        chars="Fine print in Courier New", mono=True)
+    (_d, face), = fontmatch.closest_faces(ref, fontmatch.default_index())
+    assert face.mono and face.weight <= 550
+
+
+def test_sans_text_doesnt_get_a_serif_lookalike(installed_fonts):
+    installed_fonts(TIMES, PALATINO, HELVETICA)
+    doc = _pdf_with(SUPPLEMENTAL / "Verdana.ttf", "Invoice total due")
+    face = te.similar_face(doc, doc[0], te.page_runs(doc[0], 0)[0],
+                           te.resolve_original_font(doc, doc[0],
+                                                    te.page_runs(doc[0], 0)[0])[0])
+    assert face.family == "Helvetica"
+
+
+def test_installed_ttc_faces_keep_their_names_in_the_pdf(installed_fonts):
+    installed_fonts(HELVETICA, "HelveticaNeue.ttc")
+    index = fontmatch.default_index()
+    for name in ("Helvetica-Bold", "HelveticaNeue-Medium"):
+        subset = fontmatch.subset_font(index.exact(name), "Hello")
+        assert te.same_font_name(subset.name, name), subset.name
+
+
+def test_editing_text_added_in_an_installed_ttc_font(installed_fonts, sample_doc):
+    installed_fonts("HelveticaNeue.ttc", TIMES)
+    style = te.TextStyle(family="Helvetica Neue", size=14, bold=True)
+    page = sample_doc[0]
+    te.apply_add_text(page, te.plan_add_text(page, 0, (60, 300), "Hello", style))
+    run = next(r for r in te.page_runs(page, 0) if r.text == "Hello")
+    assert "HelveticaNeue" in run.font.replace(" ", "")
+    plan = te.plan_edit(sample_doc, page, run, "Hello Wizard")
+    assert plan.warnings == []
+    assert {s.choice.kind for s in plan.segments} <= {te.ORIGINAL, te.DOCUMENT,
+                                                      te.INSTALLED}
+    te.apply_edit(page, plan)
+    assert "Hello Wizard" in page.get_text()
+
+
+def test_generic_font_names_never_match():
+    assert not te.same_font_name("Bold", "Bold")
+    assert not te.same_font_name("Regular", "ABCDEF+Regular")
+    assert te.same_font_name("Bold", "Bold", allow_generic=True)
+
+
+def test_document_fonts_with_the_same_name_but_other_widths_are_skipped(installed_fonts):
+    """Two different typefaces both called "Bold" (as a careless subsetter
+    names them) mustn't be mixed."""
+    doc = pymupdf.open()
+    for path, text in ((SUPPLEMENTAL / "Georgia.ttf", "Hello there"),
+                       (SUPPLEMENTAL / "Verdana.ttf", "Zebra Hello")):
+        font = TTFont(io.BytesIO(_subset_bytes(path, text)))
+        for record in font["name"].names:
+            if record.nameID in (1, 4, 6):
+                record.string = "Bold"
+        out = io.BytesIO()
+        font.save(out)
+        page = doc.new_page(width=400, height=200)
+        writer = pymupdf.TextWriter(page.rect)
+        writer.append((40, 100), text, font=pymupdf.Font(fontbuffer=out.getvalue()),
+                      fontsize=14)
+        writer.write_text(page)
+    doc = pymupdf.open("pdf", doc.tobytes())
+    plan = _plan(doc, "Hello Zebra")
+    assert te.DOCUMENT not in {s.choice.kind for s in plan.segments}
+
+
+def test_document_fonts_with_the_same_real_name_but_other_widths_are_skipped():
+    """Even a proper name isn't proof: a "Georgia" whose widths differ
+    from the run's own Georgia isn't used for it."""
+    doc = pymupdf.open()
+    for path, text in ((SUPPLEMENTAL / "Georgia.ttf", "Hello there"),
+                       (SUPPLEMENTAL / "Verdana.ttf", "Zebra Hello")):
+        font = TTFont(io.BytesIO(_subset_bytes(path, text)))
+        for record in font["name"].names:
+            if record.nameID in (1, 4, 6):
+                record.string = "Georgia"
+        out = io.BytesIO()
+        font.save(out)
+        page = doc.new_page(width=400, height=200)
+        writer = pymupdf.TextWriter(page.rect)
+        writer.append((40, 100), text, font=pymupdf.Font(fontbuffer=out.getvalue()),
+                      fontsize=14)
+        writer.write_text(page)
+    doc = pymupdf.open("pdf", doc.tobytes())
+    plan = _plan(doc, "Hello Zebra")
+    assert te.DOCUMENT not in {s.choice.kind for s in plan.segments}
+
+
+def test_lookalike_cache_tells_unembedded_fonts_apart_by_widths(installed_fonts):
+    installed_fonts(HELVETICA, TIMES)
+    times_like = _non_embedded_pdf("MysteryFont", SYSTEM_FONTS / "Times.ttc", "Hello world")
+    helv_like = _non_embedded_pdf("MysteryFont", SUPPLEMENTAL / "Arial.ttf", "Hello world")
+    assert _plan(times_like, "Hello there").substitute_label == "Times"
+    assert _plan(helv_like, "Hello there").substitute_label == "Helvetica"
+
+
+def test_a_damaged_cache_entry_is_read_again(tmp_path):
+    fonts = tmp_path / "fonts"
+    fonts.mkdir()
+    (fonts / "Arial.ttf").symlink_to(SUPPLEMENTAL / "Arial.ttf")
+    cache = tmp_path / "cache.json"
+    fontmatch.FontIndex(dirs=(str(fonts),), cache_path=str(cache)).faces()
+    data = json.loads(cache.read_text())
+    for entry in data.values():
+        entry["faces"][0]["unexpected"] = 1
+    cache.write_text(json.dumps(data))
+    assert [f.family for f in fontmatch.FontIndex(
+        dirs=(str(fonts),), cache_path=str(cache)).faces()] == ["Arial"]
+
+
+def test_a_failing_scan_means_no_installed_fonts_not_a_crash(tmp_path, monkeypatch):
+    index = fontmatch.FontIndex(dirs=(str(tmp_path),), cache_path=None)
+    monkeypatch.setattr(index, "_scan", lambda: 1 / 0)
+    assert index.faces() == [] and index.exact("Arial") is None
+
+
+def test_cached_entries_are_reused_not_reread(tmp_path, monkeypatch):
+    fonts = tmp_path / "fonts"
+    fonts.mkdir()
+    (fonts / "Arial.ttf").symlink_to(SUPPLEMENTAL / "Arial.ttf")
+    cache = tmp_path / "cache.json"
+    fontmatch.FontIndex(dirs=(str(fonts),), cache_path=str(cache)).faces()
+    monkeypatch.setattr(fontmatch, "_read_faces",
+                        lambda path: pytest.fail(f"re-read {path}"))
+    assert len(fontmatch.FontIndex(dirs=(str(fonts),),
+                                   cache_path=str(cache)).faces()) == 1
+
+
+@pytest.mark.parametrize("fs_type", [fontmatch.FS_RESTRICTED,
+                                     fontmatch.FS_NO_SUBSETTING,
+                                     fontmatch.FS_BITMAP_ONLY])
+def test_every_embedding_restriction_is_respected(tmp_path, fs_type):
+    font = TTFont(str(SUPPLEMENTAL / "Georgia.ttf"))
+    font["OS/2"].fsType = fs_type
+    fonts = tmp_path / "fonts"
+    fonts.mkdir()
+    font.save(str(fonts / "Restricted.ttf"))
+    assert fontmatch.FontIndex(dirs=(str(fonts),), cache_path=None).usable_faces() == []
+
+
+def test_colour_emoji_fonts_arent_offered(installed_fonts):
+    installed_fonts("Apple Color Emoji.ttc", HELVETICA)
+    assert fontmatch.default_index().families() == ["Helvetica"]
+
+
+def test_document_fonts_are_listed_once_per_document(installed_fonts, monkeypatch):
+    installed_fonts(HELVETICA)
+    doc = _pdf_with(SUPPLEMENTAL / "Georgia.ttf", "Quarterly report",
+                    extra_pages=("ZEBRA 2025",))
+    _plan(doc, "Quarterly ZEBRA report")
+    calls = []
+    real = te._embedded_choice
+    monkeypatch.setattr(te, "_embedded_choice",
+                        lambda *a, **k: calls.append(1) or real(*a, **k))
+    _plan(doc, "Quarterly ZEBRA report 2025")
+    assert calls == []
+
+
+def test_a_full_name_match_wins_whatever_the_bold_flag_says(installed_fonts):
+    installed_fonts("Supplemental/Arial Black.ttf", ARIAL)
+    doc = _pdf_with(SUPPLEMENTAL / "Arial Black.ttf", "Big heading")
+    run = te.page_runs(doc[0], 0)[0]
+    chain = te.FontChain(doc, doc[0], run, None)
+    assert chain._installed_face().label == "Arial Black"
+
+
+def test_characters_sharing_a_glyph_are_written_apart(installed_fonts):
+    installed_fonts(ARIAL)
+    doc = _pdf_with(SUPPLEMENTAL / "Arial.ttf", "Total due")
+    new = "Total-­ due now"      # hyphen + soft hyphen, NBSP
+    plan = _plan(doc, new)
+    assert plan.can_apply
+    _apply(doc, plan)
+    assert new in doc[0].get_text()
+    # ...and in Arial: PyMuPDF quietly draws a character missing from a
+    # subset with a fallback font, which would still read back.
+    assert all("Arial" in name for name in _span_fonts(doc[0]))

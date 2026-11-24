@@ -61,6 +61,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+import string
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -433,10 +434,29 @@ STANDARD = "standard"    # Helvetica, Times or Courier: the last resort
 SAME_TYPEFACE = (ORIGINAL, DOCUMENT, INSTALLED)
 
 
-def same_font_name(a: str, b: str) -> bool:
+def same_font_name(a: str, b: str, allow_generic: bool = False) -> bool:
     """Whether two names for a font mean the same face: "ArialMT",
-    "Arial Regular" and "ABCDEF+Arial" do; "Arial-BoldMT" doesn't."""
-    return bool(fontmatch.name_keys(a) & fontmatch.name_keys(b))
+    "Arial Regular" and "ABCDEF+Arial" do; "Arial-BoldMT" doesn't.
+
+    Generic names ("Regular", "Bold") match nothing, unless
+    ``allow_generic``, when they match exactly the same name (for a font on
+    the same page that must also draw the run's characters)."""
+    if fontmatch.name_keys(a) & fontmatch.name_keys(b):
+        return True
+    return allow_generic and normalize_font_name(a) == normalize_font_name(b) != ""
+
+
+def metrics_agree(a: pymupdf.Font, b: pymupdf.Font, chars: str) -> bool:
+    """Whether two fonts are plausibly subsets of one typeface: the
+    characters both have get the same widths, and (with none in common)
+    the fonts' ascender and descender match."""
+    shared = [c for c in dict.fromkeys(chars)
+              if not c.isspace() and a.has_glyph(ord(c)) and b.has_glyph(ord(c))]
+    if not shared:
+        return (abs(a.ascender - b.ascender) <= 0.01
+                and abs(a.descender - b.descender) <= 0.01)
+    return all(abs(a.glyph_advance(ord(c)) - b.glyph_advance(ord(c))) <= 0.005
+               for c in shared)
 
 
 @dataclass(frozen=True)
@@ -584,29 +604,33 @@ class FontChain:
     # -- The stages -------------------------------------------------------
 
     def _document_fonts(self) -> List[FontChoice]:
-        found, seen = [], set()
-        if self.original is not None:
-            seen.add(self.original.key)
-        for pno in range(len(self.doc)):
-            for xref, ext, _type, basefont, *_ in self.doc.get_page_fonts(pno, full=True):
-                if xref in seen or ext in ("", "n/a"):
-                    continue
-                seen.add(xref)
-                if not same_font_name(basefont, self.run.font):
-                    continue
-                choice = _embedded_choice(self.doc, xref, self.run.font, DOCUMENT)
-                if choice is not None and choice.key not in seen:
-                    seen.add(choice.key)
-                    found.append(choice)
+        found = []
+        for name, choice in _embedded_fonts(self.doc):
+            if self.original is not None and choice.key == self.original.key:
+                continue
+            if not same_font_name(name, self.run.font):
+                continue
+            # Same name isn't proof: where both can draw the run's text,
+            # the widths must agree too.
+            if self.original is not None and not metrics_agree(
+                    self.original.font, choice.font,
+                    string.ascii_letters + string.digits + self.run.text):
+                continue
+            found.append(FontChoice(font=choice.font, label=self.run.font,
+                                    original=False, key=choice.key,
+                                    check_ink=True, kind=DOCUMENT))
         return found
 
     def _installed_face(self) -> Optional[Face]:
-        face = fontmatch.default_index().exact(self.run.font, self.run.bold,
-                                               self.run.italic)
-        if face is None:
+        found = fontmatch.default_index().match(self.run.font, self.run.bold,
+                                                self.run.italic)
+        if found is None:
             return None
-        # A family match must also have the right weight and slant.
-        if face.italic != self.run.italic or (face.weight >= 600) != self.run.bold:
+        face, by_full_name = found
+        # A match on the family name alone must also have the right weight
+        # and slant (a full-name match like "Arial-Black" names the face).
+        if not by_full_name and (face.italic != self.run.italic
+                                 or (face.weight >= 600) != self.run.bold):
             return None
         return face
 
@@ -618,6 +642,32 @@ class FontChain:
         face = similar_face(self.doc, self.page, self.run, self.original,
                             self.runs)
         return [installed_choice(face, SIMILAR)] if face else []
+
+
+def _embedded_fonts(doc: pymupdf.Document) -> List[Tuple[str, FontChoice]]:
+    """Every reusable embedded font in the document, under each name it
+    goes by (the name the PDF declares, and the font program's own).
+    Worked out once per document: an undo or redo loads a new document
+    object, so this can't go stale across them."""
+    cached = getattr(doc, "_pdfeditor_embedded_fonts", None)
+    if cached is not None:
+        return cached
+    found, seen = [], set()
+    for pno in range(len(doc)):
+        for xref, ext, _type, basefont, *_ in doc.get_page_fonts(pno, full=True):
+            if xref in seen or ext in ("", "n/a"):
+                continue
+            seen.add(xref)
+            choice = _embedded_choice(doc, xref, basefont, DOCUMENT)
+            if choice is None:
+                continue
+            for name in dict.fromkeys((basefont, choice.font.name)):
+                found.append((name, choice))
+    try:
+        doc._pdfeditor_embedded_fonts = found
+    except AttributeError:
+        pass
+    return found
 
 
 def _embedded_choice(doc: pymupdf.Document, xref: int, label: str,
@@ -665,8 +715,12 @@ def similar_face(doc: pymupdf.Document, page: pymupdf.Page, run: TextRun,
                  runs: Optional[List[TextRun]] = None) -> Optional[Face]:
     """The installed font that looks most like ``run``'s (see fontmatch)."""
     reference_font = original.font if original is not None else None
+    widths = () if reference_font is not None else _pdf_widths(doc, page, run)
+    # An embedded font is identified by its content; one that isn't
+    # embedded by its name *and* the widths the PDF records for it (two
+    # PDFs can use one name for different fonts).
     key = (original.key if original else normalize_font_name(run.font),
-           run.bold, run.italic, run.monospaced, run.serif)
+           widths, run.bold, run.italic, run.monospaced, run.serif)
     if key not in _SIMILAR_CACHE:
         if runs is None:
             runs = page_runs(page, run.page_num)
@@ -676,10 +730,12 @@ def similar_face(doc: pymupdf.Document, page: pymupdf.Page, run: TextRun,
                             if reference_font.has_glyph(ord(c)))
         ref = fontmatch.Reference(
             font=reference_font, chars=chars or run.text,
-            widths=() if reference_font is not None else _pdf_widths(doc, page, run),
+            widths=widths,
             bold=run.bold, italic=run.italic, mono=run.monospaced,
-            # Flags often leave "serif" unset; only trust a yes.
-            serif=True if run.serif else None)
+            # Flags often leave "serif" unset, so a no means "don't know",
+            # unless the name says sans.
+            serif=(True if run.serif
+                   else False if fontmatch.looks_sans(run.font) else None))
         ranked = fontmatch.closest_faces(ref, fontmatch.default_index())
         _SIMILAR_CACHE[key] = ranked[0][1] if ranked else None
     return _SIMILAR_CACHE[key]
@@ -710,8 +766,8 @@ def resolve_original_font(doc: pymupdf.Document, page: pymupdf.Page,
         # which needn't match the name the PDF declares for it (e.g. a
         # font declared "Helvetica" whose program is "NimbusSans-Regular"),
         # so accept a match on either.
-        if not (same_font_name(run.font, basefont)
-                or same_font_name(run.font, font.name)):
+        if not (same_font_name(run.font, basefont, allow_generic=True)
+                or same_font_name(run.font, font.name, allow_generic=True)):
             continue
         found_embedded = True
         if not font.is_writable:
@@ -885,14 +941,50 @@ def plan_edit(doc: pymupdf.Document, page: pymupdf.Page, run: TextRun,
 
 def writing_fonts(segments: List[Segment]) -> List[Tuple[str, pymupdf.Font]]:
     """(text, font) pieces to write. An installed font is written as a
-    subset holding just the characters this edit uses, not the whole font."""
-    needed: Dict[str, str] = {}
+    subset holding just the characters this edit uses, not the whole font.
+
+    Characters that share one glyph in a font (hyphen and soft hyphen,
+    space and no-break space) go into separate subsets, so each extracts
+    as itself when copied."""
+    # For each installed font: the character groups, each one subset.
+    groups: Dict[str, List[Dict[int, str]]] = {}
+    group_of: Dict[Tuple[str, str], int] = {}
+    for segment in segments:
+        choice = segment.choice
+        if choice.face is None:
+            continue
+        for ch in segment.text:
+            if (choice.key, ch) in group_of:
+                continue
+            glyph = choice.font.has_glyph(ord(ch))
+            sets = groups.setdefault(choice.key, [])
+            index = next((i for i, g in enumerate(sets)
+                          if glyph not in g or g[glyph] == ch), len(sets))
+            if index == len(sets):
+                sets.append({})
+            sets[index][glyph] = ch
+            group_of[(choice.key, ch)] = index
+    subsets: Dict[Tuple[str, int], pymupdf.Font] = {}
     for segment in segments:
         if segment.choice.face is not None:
-            needed[segment.choice.key] = needed.get(segment.choice.key, "") + segment.text
-    subsets = {s.choice.key: fontmatch.subset_font(s.choice.face, needed[s.choice.key])
-               for s in segments if s.choice.face is not None}
-    return [(s.text, subsets.get(s.choice.key, s.choice.font)) for s in segments]
+            for index, group in enumerate(groups[segment.choice.key]):
+                subsets[(segment.choice.key, index)] = None
+    faces = {s.choice.key: s.choice.face for s in segments if s.choice.face is not None}
+    for (key, index) in subsets:
+        subsets[(key, index)] = fontmatch.subset_font(
+            faces[key], "".join(groups[key][index].values()))
+
+    pieces: List[Tuple[str, pymupdf.Font]] = []
+    for segment in segments:
+        choice = segment.choice
+        for ch in segment.text:
+            font = (subsets[(choice.key, group_of[(choice.key, ch)])]
+                    if choice.face is not None else choice.font)
+            if pieces and pieces[-1][1] is font:
+                pieces[-1] = (pieces[-1][0] + ch, font)
+            else:
+                pieces.append((ch, font))
+    return pieces
 
 
 def removal_rect(run: TextRun) -> pymupdf.Rect:
@@ -1061,10 +1153,11 @@ def apply_add_text(page: pymupdf.Page, plan: AddPlan) -> None:
     if not plan.can_apply:
         raise EditError(plan.errors[0] if plan.errors else "There's no text to add.")
     expected = _char_counts(page) + _counted(plan.text)
-    font = (fontmatch.subset_font(plan.face, plan.text) if plan.face is not None
-            else pymupdf.Font(plan.style.font_code))
-    write_text(page, plan.origin, [(plan.text, font)],
-               plan.style.size, plan.style.color)
+    if plan.face is not None:
+        pieces = writing_fonts([Segment(plan.text, installed_choice(plan.face, INSTALLED))])
+    else:
+        pieces = [(plan.text, pymupdf.Font(plan.style.font_code))]
+    write_text(page, plan.origin, pieces, plan.style.size, plan.style.color)
     probe = EditPlan(run=TextRun(plan.page_num, "", "", plan.style.size, 0,
                                  plan.style.color, plan.origin, (0, 0, 0, 0),
                                  (1.0, 0.0)),

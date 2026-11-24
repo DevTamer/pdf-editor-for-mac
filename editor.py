@@ -1187,6 +1187,14 @@ class EditorWindow:
     def _save_to(self, path: str) -> bool:
         if self.view.entry is not None and not self._commit_inline_edit():
             return False
+        other = next((w for w in self.app.windows
+                      if w is not self and w.shows(path)), None)
+        if other is not None:
+            self._show_error(
+                "File Is Open",
+                f"“{os.path.basename(path)}” is open in another window. "
+                "Close it there first, or save under another name.")
+            return False
         try:
             self.model.save_document(path)
         except Exception as exc:
@@ -1370,6 +1378,7 @@ class EditorApp:
         self.root.withdraw()
         self.windows: List[EditorWindow] = []
         self._quitting = False
+        self._asking = False
         # Find the installed fonts now, so the first edit that needs one
         # doesn't wait (a second or so the very first time; cached after).
         fontmatch.default_index().load_in_background()
@@ -1431,11 +1440,21 @@ class EditorApp:
     def quit(self, *args) -> None:
         """Ask about each window's unsaved changes, then quit. Cancelling
         any of them cancels quitting."""
-        for win in list(self.windows):
-            if win.model.is_dirty or win.view.entry is not None:
-                win.bring_to_front()
-            if not win._confirm_discard():
-                return
+        # Dialogs are sheets, so Quit can be chosen again while one of
+        # ours is still asking: ignore that.
+        if self._asking:
+            return
+        self._asking = True
+        try:
+            for win in list(self.windows):
+                if win not in self.windows:
+                    continue                      # closed meanwhile
+                if win.model.is_dirty or win.view.entry is not None:
+                    win.bring_to_front()
+                if not win._confirm_discard():
+                    return
+        finally:
+            self._asking = False
         self._quitting = True
         for win in list(self.windows):
             win.destroy()

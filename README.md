@@ -99,9 +99,15 @@ are a lookalike, and you're asked first:
 > 9 E R
 
 An installed font is never embedded whole, only the characters you typed,
-so the file grows by a few KB. Fonts whose licence forbids embedding are
-never used. Installed fonts are scanned once, in the background at launch
-(about a second), and remembered afterwards.
+so the file grows by a few KB. Fonts whose licence forbids embedding or
+subsetting are never used, nor are colour-bitmap fonts like Apple Color
+Emoji. Installed fonts are scanned once, in the background at launch
+(about a second), and remembered afterwards; a font installed while the app
+is running is found the next time it starts.
+
+Two fonts with the same name aren't assumed to be the same: a copy found
+elsewhere in the PDF is only used if its character widths agree with the
+run's own font.
 
 The text box you type in also shows the matched font, when macOS can
 display it (fonts inside Word's app bundle can't be, so a lookalike is

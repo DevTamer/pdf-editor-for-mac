@@ -887,3 +887,46 @@ def test_adding_text_in_an_installed_font(app, installed_fonts):
     fonts = {s["font"] for b in app.model.get_page(0).get_text("dict")["blocks"]
              if b["type"] == 0 for line in b["lines"] for s in line["spans"]}
     assert "Georgia" in fonts
+
+
+def test_return_reaches_the_window_from_every_clickable_widget(app):
+    """Return is handled on the window: it arrives there from any widget
+    that can take the focus, unless that widget's own class binding
+    handles Return first."""
+    top = str(app.window)
+    widgets = [app.undo_btn, app.save_btn, app.history_list, app.family_box,
+               app.canvas] + list(app.tool_buttons.values())
+    widgets += [w for w in _descendants(app.window)
+                if w.winfo_class() in ("TCheckbutton", "TRadiobutton")]
+    for widget in widgets:
+        assert top in widget.bindtags(), widget
+        assert "break" not in app.window.bind_class(widget.winfo_class(),
+                                                    "<Return>"), widget
+
+
+def test_quit_isnt_reentered_while_asking(app, editor_app, monkeypatch):
+    _click(app, TARGET)
+    _type(app, "Unsaved")
+    _press(app, "<Return>")
+    calls = []
+
+    def ask(*a, **k):
+        calls.append(1)
+        editor_app.quit()             # Quit chosen again while the sheet is up
+        return None                   # then Cancel
+    monkeypatch.setattr(editor.messagebox, "askyesnocancel", ask)
+    editor_app.quit()
+    assert calls == [1] and editor_app.windows == [app]
+
+
+def test_save_as_onto_a_file_open_in_another_window_is_refused(
+        app, editor_app, tmp_path, monkeypatch):
+    other = _other_pdf(tmp_path, "b.pdf", "Document B")
+    editor_app.open_paths(other)
+    shown = []
+    monkeypatch.setattr(editor.messagebox, "showerror",
+                        lambda title, message, **k: shown.append(message))
+    monkeypatch.setattr(editor.filedialog, "asksaveasfilename", lambda **k: other)
+    assert not app._on_save_as()
+    assert shown and "open in another window" in shown[0]
+    assert "Document B" in pymupdf.open(other)[0].get_text()

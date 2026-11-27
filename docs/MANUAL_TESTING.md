@@ -131,3 +131,7 @@ Use a few real PDFs:
       cancels.
 - [ ] The saved file opens correctly in Preview and in a browser, and shows
       the edits.
+- [ ] File → Metadata on Save: with the default, Preview's Inspector (Cmd+I)
+      shows today's modification date and the original title, author and
+      creator. With "Remove Document Info" it shows none of them. The
+      choice is still selected after quitting and relaunching.

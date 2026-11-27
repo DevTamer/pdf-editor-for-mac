@@ -17,7 +17,10 @@ from pdfcore.frozen import configure_bundled_tcl_tk
 
 configure_bundled_tcl_tk()
 
+import datetime  # noqa: E402
+import json  # noqa: E402
 import math  # noqa: E402
+import re  # noqa: E402
 import tempfile  # noqa: E402
 import tkinter as tk  # noqa: E402  (must follow configure_bundled_tcl_tk)
 from tkinter import colorchooser, filedialog, messagebox, ttk  # noqa: E402
@@ -55,6 +58,14 @@ HISTORY_LIMIT = 30  # Max snapshots kept in the undo/redo history...
 HISTORY_BUDGET = 400 * 1024 * 1024  # ...and roughly the memory they may use
 MIN_HISTORY = 5     # but always at least this many, however big the file
 
+# What saving does with the document's metadata (File > Metadata on Save).
+METADATA_UPDATE_DATE = "update-date"   # keep it, with today's modification date
+METADATA_KEEP = "keep"                 # keep it exactly as it was
+METADATA_REMOVE = "remove"             # remove the document info
+METADATA_MODES = (METADATA_UPDATE_DATE, METADATA_KEEP, METADATA_REMOVE)
+SETTINGS_PATH = os.path.expanduser(
+    "~/Library/Application Support/PDF Editor/settings.json")
+
 TOOL_EDIT = "edit"
 TOOL_ADD = "add"
 TOOL_ERASE = "erase"
@@ -74,6 +85,65 @@ def _current_umask() -> int:
     mask = os.umask(0)
     os.umask(mask)
     return mask
+
+
+def _xmp_now() -> str:
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+_XMP_DATES = re.compile(
+    r"(xmp:(?:ModifyDate|MetadataDate)\s*=\s*[\"'])[^\"']*([\"'])"   # attribute
+    r"|(<xmp:(?:ModifyDate|MetadataDate)>)[^<]*(</xmp:)")         # element
+
+
+def update_modification_date(doc: pymupdf.Document) -> None:
+    """Set the document's modification date to now, in the Info
+    dictionary and the XMP metadata, changing nothing else (Producer,
+    Creator, custom fields all stay). A PDF without either gets none."""
+    kind, value = doc.xref_get_key(-1, "Info")
+    if kind == "xref":
+        info = int(value.split()[0])
+        doc.xref_set_key(info, "ModDate", f"({pymupdf.get_pdf_now()})")
+    xmp = doc.get_xml_metadata()
+    if xmp:
+        now = _xmp_now()
+        doc.set_xml_metadata(_XMP_DATES.sub(
+            lambda m: (f"{m.group(1)}{now}{m.group(2)}" if m.group(1)
+                       else f"{m.group(3)}{now}{m.group(4)}"), xmp))
+
+
+def remove_document_info(doc: pymupdf.Document) -> None:
+    """Remove the document info (title, author, dates, creator, producer
+    and any custom fields), all XMP metadata, and applications' private
+    data (/PieceInfo, which can hold a copy of the original content)."""
+    doc.scrub(attached_files=False, clean_pages=False, embedded_files=False,
+              hidden_text=False, javascript=False, metadata=True,
+              redactions=False, remove_links=False, reset_fields=False,
+              reset_responses=False, thumbnails=False, xml_metadata=True)
+    for xref in [doc.pdf_catalog()] + [page.xref for page in doc]:
+        if doc.xref_get_key(xref, "PieceInfo")[0] != "null":
+            doc.xref_set_key(xref, "PieceInfo", "null")
+
+
+def load_settings() -> dict:
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(settings: dict) -> None:
+    """Best effort: a setting that can't be saved just isn't remembered."""
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+        tmp = SETTINGS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(settings, fh)
+        os.replace(tmp, SETTINGS_PATH)
+    except OSError:
+        pass
 
 
 def _short(text: str, limit: int = 24) -> str:
@@ -230,8 +300,14 @@ class EditorModel(DocumentSession):
 
     # -- Saving ---------------------------------------------------------------
 
-    def save_document(self, path: str) -> None:
+    def save_document(self, path: str,
+                      metadata: str = METADATA_UPDATE_DATE) -> None:
         """Write the current state to ``path``.
+
+        ``metadata`` says what happens to the document's metadata: keep
+        it with today's modification date (the default), keep it exactly,
+        or remove it (see METADATA_MODES). The open document isn't
+        changed either way.
 
         Saves from a copy, never from the live document: in PyMuPDF
         1.24, a garbage-collecting save of a document with newly written
@@ -240,7 +316,13 @@ class EditorModel(DocumentSession):
         saving over the file that's open works, and a failed save never
         leaves a half-written file behind.
         """
+        if metadata not in METADATA_MODES:
+            raise ValueError(metadata)
         copy = pymupdf.open(stream=self.doc.tobytes(), filetype="pdf")
+        if metadata == METADATA_UPDATE_DATE:
+            update_modification_date(copy)
+        elif metadata == METADATA_REMOVE:
+            remove_document_info(copy)
         directory = os.path.dirname(os.path.abspath(path))
         # Keep an existing file's permissions; give a new file the usual
         # ones (mkstemp creates its temp file readable by the owner only).
@@ -661,6 +743,15 @@ class EditorWindow:
                               accelerator="Cmd+S")
         file_menu.add_command(label="Save As...", command=self._on_save_as,
                               accelerator="Cmd+Shift+S")
+        metadata_menu = tk.Menu(file_menu, tearoff=0)
+        for mode, label in (
+                (METADATA_UPDATE_DATE, "Keep, with Today's Modification Date"),
+                (METADATA_KEEP, "Keep Exactly as It Was"),
+                (METADATA_REMOVE, "Remove Document Info")):
+            metadata_menu.add_radiobutton(label=label, value=mode,
+                                          variable=self.app.metadata_var)
+        file_menu.add_cascade(label="Metadata on Save", menu=metadata_menu)
+        self.metadata_menu = metadata_menu
         file_menu.add_separator()
         file_menu.add_command(label="Close", command=self._on_close_doc,
                               accelerator="Cmd+W")
@@ -1195,12 +1286,15 @@ class EditorWindow:
                 f"“{os.path.basename(path)}” is open in another window. "
                 "Close it there first, or save under another name.")
             return False
+        mode = self.app.metadata_var.get()
         try:
-            self.model.save_document(path)
+            self.model.save_document(path, metadata=mode)
         except Exception as exc:
             self._show_error("Error", f"Could not save PDF:\n{exc}")
             return False
-        self._set_status(f"Saved to {os.path.basename(path)}")
+        note = {METADATA_UPDATE_DATE: "", METADATA_KEEP: " (metadata kept as it was)",
+                METADATA_REMOVE: " (document info removed)"}[mode]
+        self._set_status(f"Saved to {os.path.basename(path)}{note}")
         self._update_ui_state()
         return True
 
@@ -1379,6 +1473,13 @@ class EditorApp:
         self.windows: List[EditorWindow] = []
         self._quitting = False
         self._asking = False
+        # File > Metadata on Save: one choice for every window, remembered
+        # between launches.
+        self.settings = load_settings()
+        mode = self.settings.get("metadata")
+        self.metadata_var = tk.StringVar(
+            self.root, value=mode if mode in METADATA_MODES else METADATA_UPDATE_DATE)
+        self.metadata_var.trace_add("write", self._on_metadata_mode)
         # Find the installed fonts now, so the first edit that needs one
         # doesn't wait (a second or so the very first time; cached after).
         fontmatch.default_index().load_in_background()
@@ -1459,6 +1560,10 @@ class EditorApp:
         for win in list(self.windows):
             win.destroy()
         self._destroy_root()
+
+    def _on_metadata_mode(self, *args) -> None:
+        self.settings["metadata"] = self.metadata_var.get()
+        save_settings(self.settings)
 
     def _on_reopen(self, *args) -> None:
         if not self.windows:

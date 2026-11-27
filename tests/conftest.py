@@ -80,6 +80,13 @@ def _use_fonts(directory: Path):
 
 
 @pytest.fixture(autouse=True)
+def private_settings(tmp_path, monkeypatch):
+    """Tests never read or write the real settings file."""
+    import editor
+    monkeypatch.setattr(editor, "SETTINGS_PATH", str(tmp_path / "settings.json"))
+
+
+@pytest.fixture(autouse=True)
 def no_installed_fonts(tmp_path_factory):
     """By default tests see no installed fonts, so results don't depend on
     what's installed on the machine running them (new characters fall back

@@ -41,7 +41,24 @@ window, so clicking Bold, the colour or the History list first is fine.
 Every change is one step in the **History** panel. Each window has its own. Use **Undo/Redo**
 (`Cmd+Z` / `Cmd+Shift+Z`), or click any entry to jump back to it.
 
-**Save** (`Cmd+S`) or **Save As…** (`Cmd+Shift+S`). The first save suggests
+**Save** (`Cmd+S`) or **Save As…** (`Cmd+Shift+S`). A save writes a whole
+new file, not changes appended to the old one, so nothing of the earlier
+version is left inside it. Edits go straight into the page itself, not
+onto an extra layer or annotation.
+
+**File → Metadata on Save** decides what happens to the document's
+metadata (title, author, dates, the app that made it). It's one setting
+for all windows, remembered between launches:
+
+- **Keep, with Today's Modification Date** (the default): only the
+  modification date changes, in both the document info and the XMP
+  metadata. Everything else, including the Producer, stays as it was.
+- **Keep Exactly as It Was**: nothing changes.
+- **Remove Document Info**: removes the document info, all XMP metadata
+  (the document's and each page's) and applications' private data
+  (`PieceInfo`, which can hold a copy of the original content).
+
+ The first save suggests
 `<name>_edited.pdf`. Your original file is only replaced if you choose to
 save over it. Closing a window, or quitting (`Cmd+Q`), asks about unsaved
 changes in each window first.

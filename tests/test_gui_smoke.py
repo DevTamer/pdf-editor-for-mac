@@ -5,6 +5,7 @@ Needs a working Tcl/Tk and a display session; skips itself cleanly when a
 Tk root can't be created.
 """
 
+import json
 import os
 
 import pymupdf
@@ -930,3 +931,46 @@ def test_save_as_onto_a_file_open_in_another_window_is_refused(
     assert not app._on_save_as()
     assert shown and "open in another window" in shown[0]
     assert "Document B" in pymupdf.open(other)[0].get_text()
+
+
+# -- Metadata on Save -----------------------------------------------------------------
+
+def test_metadata_menu_offers_the_three_choices(app, editor_app):
+    menu = app.metadata_menu
+    labels = [menu.entrycget(i, "label") for i in range(menu.index("end") + 1)]
+    assert labels == ["Keep, with Today's Modification Date",
+                      "Keep Exactly as It Was", "Remove Document Info"]
+    assert editor_app.metadata_var.get() == editor.METADATA_UPDATE_DATE
+
+
+def test_metadata_choice_is_used_when_saving_and_remembered(app, editor_app,
+                                                            tmp_path, monkeypatch):
+    menu = app.metadata_menu
+    menu.invoke(2)                                  # Remove Document Info
+    assert editor_app.metadata_var.get() == editor.METADATA_REMOVE
+    assert json.load(open(editor.SETTINGS_PATH)) == {"metadata": editor.METADATA_REMOVE}
+
+    out = tmp_path / "saved.pdf"
+    monkeypatch.setattr(editor.filedialog, "asksaveasfilename", lambda **k: str(out))
+    used = []
+    real = app.model.save_document
+    monkeypatch.setattr(app.model, "save_document",
+                        lambda path, metadata: used.append(metadata) or real(path, metadata))
+    assert app._on_save_as()
+    assert used == [editor.METADATA_REMOVE]
+    assert "document info removed" in app.status_label["text"]
+
+    # A new launch starts with the remembered choice.
+    again = editor.EditorApp()
+    try:
+        assert again.metadata_var.get() == editor.METADATA_REMOVE
+    finally:
+        again._destroy_root()
+
+
+def test_all_windows_share_the_metadata_choice(app, editor_app, tmp_path):
+    second = editor_app.new_window()
+    second.metadata_menu.invoke(1)                  # Keep Exactly as It Was
+    assert editor_app.metadata_var.get() == editor.METADATA_KEEP
+    assert str(app.metadata_menu.entrycget(1, "variable")) == \
+        str(second.metadata_menu.entrycget(1, "variable"))

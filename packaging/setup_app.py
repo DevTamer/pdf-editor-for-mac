@@ -97,7 +97,7 @@ OPTIONS = {
     "argv_emulation": False,
     "iconfile": "icon.icns",
     "packages": ["pymupdf", "PIL", "pdfcore", "fontTools"],
-    "includes": ["textedit", "erase", "fontmatch"],
+    "includes": ["textedit", "erase", "fontmatch", "findreplace"],
     "plist": {
         "CFBundleName": "PDF Editor",
         "CFBundleDisplayName": "PDF Editor",

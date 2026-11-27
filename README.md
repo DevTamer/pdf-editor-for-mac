@@ -35,6 +35,31 @@ Then pick a tool from the toolbar or the **Tools** menu:
 | + **Add Text** | `Cmd+2` | Click where the new text should start and type. Choose the font (any installed font, or the standard Helvetica, Times and Courier), size, bold, italic and colour in the sidebar. Return adds it. |
 | ⌫ **Erase** | `Cmd+3` | Click a word to erase it. Drag from one word to another to erase everything between them, like selecting text. Drag from empty space to erase everything in a rectangle. |
 
+### Find & Replace
+
+**Edit → Find & Replace…** (`Cmd+F`) opens a bar above the page. Type what
+to find: matches are highlighted as you type, and the count shows which one
+you're on. Return or `Cmd+G` goes to the next match (Shift+Return or
+`Cmd+Shift+G` the previous one), across pages. **Match case** and **Whole
+words** narrow it down. Esc or **Done** closes the bar.
+
+- **Replace** replaces the highlighted match and moves on to the next.
+- **Replace All** first tells you how many matches on how many pages, with
+  any font warnings and any matches it has to leave alone (say, text under
+  a comment), and asks. Everything is then replaced as **one step**: one
+  Undo puts it all back. If any line can't be changed and verified,
+  nothing is replaced.
+
+Each replacement is an ordinary edit: the line keeps its font, size,
+colour and position, missing characters use the same font matching as
+typing, and the result is verified the same way.
+
+Searching ignores what text extraction shows but a reader wouldn't
+notice: "ﬁ" ligatures match "fi", no-break spaces match spaces, and soft
+hyphens are ignored. A match has to lie within one line of one style, so
+text that wraps onto the next line, or changes style part-way (a bold word
+in a regular sentence), isn't found as one match.
+
 Return and Esc apply or cancel the text box wherever you last clicked in the
 window, so clicking Bold, the colour or the History list first is fine.
 
@@ -228,11 +253,15 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The suite has six parts:
+The suite has these parts:
 
 - `test_erase.py` covers erasing: selections, fills (including paper grain),
   text removal, in-place scan edits (JPEG and 1-bit stay compact), and
   covering leftover shapes.
+- `test_findreplace.py` covers find and replace: matching (case, whole
+  words, ligatures), Replace, and Replace All as one verified,
+  all-or-nothing step.
+- `test_metadata.py` covers what saving does with metadata.
 - `test_fontmatch.py` covers font matching: names, the font index and its
   cache, licences, lookalikes and editing with installed fonts. It uses
   real macOS fonts, made "installed" one at a time so results don't
@@ -284,6 +313,8 @@ the test suite there, then builds `packaging/dist/PDF Editor.app` and
 - [`fontmatch.py`](fontmatch.py) finds installed fonts: the same font by
   name, or the closest-looking one, and embeds just the characters needed.
   No Tk.
+- [`findreplace.py`](findreplace.py) finds text and turns replacements
+  into ordinary edits. No Tk.
 - [`erase.py`](erase.py) is the erase engine, with no Tk. It handles words
   and selections, removing text character by character, the fills, in-place
   image edits and covering patches.

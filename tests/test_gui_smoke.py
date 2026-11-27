@@ -12,7 +12,7 @@ import pymupdf
 import pytest
 
 import editor
-from conftest import LINE_ABOVE, PAGE_WIDTH, TARGET, TITLE
+from conftest import LINE_ABOVE, LINE_BELOW, PAGE_WIDTH, TARGET, TITLE
 
 
 class _Event:
@@ -974,3 +974,196 @@ def test_all_windows_share_the_metadata_choice(app, editor_app, tmp_path):
     assert editor_app.metadata_var.get() == editor.METADATA_KEEP
     assert str(app.metadata_menu.entrycget(1, "variable")) == \
         str(second.metadata_menu.entrycget(1, "variable"))
+
+
+# -- Find & Replace -------------------------------------------------------------------
+
+def _search(app, query, **options):
+    app.show_find_bar()
+    app.match_case_var.set(options.get("match_case", False))
+    app.whole_word_var.set(options.get("whole_word", False))
+    app.find_var.set(query)
+    assert app._flush_find()          # as if typing paused: the search runs
+
+
+def test_cmd_f_opens_the_find_bar(app):
+    assert "show_find_bar" in app.window.bind("<Command-f>")
+    assert not app.find_bar_shown
+    app.show_find_bar()
+    assert app.find_bar_shown
+
+
+def test_typing_finds_and_outlines_matches(app):
+    _search(app, "line")
+    assert app.find_count["text"] == "1 of 3"
+    items = app.canvas.find_withtag("find")
+    kinds = sorted(app.canvas.type(i) for i in items)
+    assert kinds == ["image"] * 3 + ["rectangle"]      # 3 tints, 1 outline
+    _assert_see_through(app, "find")
+
+
+def test_no_matches_disables_replace(app):
+    _search(app, "zebra")
+    assert app.find_count["text"] == "No matches"
+    assert str(app.replace_all_btn["state"]) == "disabled"
+
+
+def test_next_and_previous_wrap_and_change_page(app):
+    _search(app, "e", match_case=True)
+    total = len(app.matches)
+    last_on_page_2 = max(i for i, m in enumerate(app.matches) if m.page_num == 1)
+    for _ in range(last_on_page_2):
+        app._find_next()
+    assert app.model.current_page == 1
+    assert app.find_count["text"] == f"{last_on_page_2 + 1} of {total}"
+    app.match_index = total - 1
+    app._find_next()                                    # wraps to the first
+    assert app.match_index == 0 and app.model.current_page == 0
+    app._find_prev()
+    assert app.match_index == total - 1
+
+
+def test_find_fields_handle_their_own_keys(app):
+    app.show_find_bar()
+    assert "_find_return" in app.find_entry.bind("<Return>")
+    assert "_find_shift_return" in app.find_entry.bind("<Shift-Return>")
+    assert "_replace_return" in app.replace_entry.bind("<Return>")
+    assert "_find_escape" in app.find_entry.bind("<Escape>")
+    assert app._find_return() == "break" and app._find_escape() == "break"
+    assert not app.find_bar_shown and app.canvas.find_withtag("find") == ()
+
+
+def test_replace_replaces_the_current_match_then_moves_on(app):
+    _search(app, "line")
+    app.replace_var.set("row")
+    app._replace_current()
+    assert "The row above the target" in _page_text(app)
+    assert app.history_list.size() == 2
+    assert app.find_count["text"] == "1 of 2"
+    assert app.matches[app.match_index].run.text.strip() == TARGET
+    assert app.model.history_entries()[-1] == "Replace “line” → “row”"
+
+
+def test_replace_all_asks_then_replaces_everything_as_one_step(app, monkeypatch):
+    _search(app, "the")
+    app.replace_var.set("a")
+    asked = []
+    monkeypatch.setattr(editor.messagebox, "askokcancel",
+                        lambda title, message, **k: asked.append(message) or True)
+    app._replace_all()
+    assert "Replace 5 occurrences of “the” with “a” on 2 pages?" in asked[0]
+    assert "Undo puts everything back" in asked[0]
+    assert app.find_count["text"] == "No matches"
+    assert app.history_list.size() == 2
+    app._on_undo()
+    assert app.find_count["text"].endswith("of 5")     # found again after undo
+
+
+def test_cancelled_replace_all_changes_nothing(app, monkeypatch):
+    _search(app, "the")
+    app.replace_var.set("a")
+    monkeypatch.setattr(editor.messagebox, "askokcancel", lambda *a, **k: False)
+    app._replace_all()
+    assert app.history_list.size() == 1 and LINE_ABOVE in _page_text(app)
+
+
+def test_replace_applies_an_open_text_box_first(app):
+    _click(app, TARGET)
+    _type(app, "Target line typed")
+    _search(app, "typed")
+    assert app.view.entry is not None
+    app.replace_var.set("done")
+    app._replace_current()
+    assert app.view.entry is None
+    assert "Target line done" in _page_text(app)
+
+
+def test_matches_follow_document_changes(app):
+    _search(app, "line")
+    app.canvas.yview_moveto(0)    # (showing a match scrolled the tiny hidden canvas)
+    _click(app, LINE_BELOW)
+    _type(app, "The row below the target")
+    _press(app, "<Return>")
+    assert app.find_count["text"].endswith("of 2")
+
+
+def _assert_see_through(app, tag):
+    """Highlights must let the text show through: no filled rectangles
+    (Tk on macOS draws stippled fills solid), and translucent images."""
+    for item in app.canvas.find_withtag(tag):
+        if app.canvas.type(item) == "rectangle":
+            assert app.canvas.itemcget(item, "fill") == "", tag
+        else:
+            name = app.canvas.itemcget(item, "image")
+            # (Tk 8.6 can't read partial alpha back, so look the image up.)
+            (_size, _color, alpha), = [key for key, image in app.view._tints.items()
+                                       if str(image) == name]
+            assert 0 < alpha < 1, tag
+
+
+def test_erase_selection_lets_the_text_show_through(app):
+    app.set_tool("erase")
+    _press_move_release_without_release(app)
+    assert app.canvas.find_withtag("erase_sel")
+    _assert_see_through(app, "erase_sel")
+
+
+def test_erase_rectangle_lets_the_text_show_through(app):
+    app.set_tool("erase")
+    app.view._on_click(_Event(5, 5))                  # empty space: a rectangle
+    app.view._on_drag(_Event(300, 200))
+    kinds = sorted(app.canvas.type(i) for i in app.canvas.find_withtag("erase_sel"))
+    assert kinds == ["image", "rectangle"]
+    _assert_see_through(app, "erase_sel")
+
+
+def _press_move_release_without_release(app):
+    start = _word_center(app, "line", baseline=150)
+    end = _word_center(app, "edit")
+    app.view._on_click(_Event(*start))
+    app.view._on_drag(_Event(*end))
+
+
+def test_a_quick_return_after_typing_isnt_undone_by_the_pending_search(app):
+    app.show_find_bar()
+    app.find_var.set("line")              # search pending (typing pause)
+    assert app._find_job is not None
+    app._find_return()                    # Return before the pause ends
+    assert app._find_job is None and app.match_index == 0
+    app._find_return()
+    assert app.match_index == 1           # and nothing resets it later
+    app.window.update()
+    assert app.match_index == 1
+
+
+def test_replace_all_uses_the_text_just_typed(app, monkeypatch):
+    app.show_find_bar()
+    app.find_var.set("line")
+    app.replace_var.set("row")
+    monkeypatch.setattr(editor.messagebox, "askokcancel", lambda *a, **k: True)
+    app._replace_all()                    # before the typing pause ended
+    assert app._find_job is None
+    assert "The row above the target" in _page_text(app)
+
+
+def test_replace_all_redraws_every_changed_page(app, monkeypatch):
+    app._next_page()                       # page 2 is now rendered and cached
+    app._prev_page()
+    assert 1 in app.renderer._cache
+    _search(app, "the")
+    app.replace_var.set("a")
+    monkeypatch.setattr(editor.messagebox, "askokcancel", lambda *a, **k: True)
+    app._replace_all()
+    assert 1 not in app.renderer._cache   # page 2 changed: drawn again when shown
+
+
+def test_an_unrelated_edit_keeps_the_current_match(app):
+    _search(app, "line")
+    app._find_next()
+    app._find_next()
+    assert app.matches[app.match_index].run.text.strip() == LINE_BELOW
+    app.canvas.yview_moveto(0)
+    _click(app, TITLE)
+    _type(app, "Quarterly Reporter")     # (letters the subset font has)
+    _press(app, "<Return>")
+    assert app.matches[app.match_index].run.text.strip() == LINE_BELOW

@@ -104,7 +104,8 @@ Use a few real PDFs:
 
 - [ ] Hovering a word outlines it in red. Clicking it erases just that word.
 - [ ] Dragging from one word to another highlights everything between them,
-      across lines, and erases it on release.
+      across lines, and erases it on release. The highlight is see-through:
+      you can still read the words you're selecting.
 - [ ] Dragging from empty space draws a dashed rectangle and erases what's
       inside. A tiny accidental drag does nothing.
 - [ ] Erasing real text shows exactly what was behind it: white paper, or a
@@ -116,6 +117,20 @@ Use a few real PDFs:
 - [ ] Erasing a rectangle over a logo or stamp hides it. A page border
       around it stays.
 - [ ] Erasing empty space shows "There was nothing to erase there."
+
+## Find & Replace
+
+- [ ] Cmd+F opens the bar with the cursor in Find. Typing highlights the
+      matches (see-through: the text stays readable) and shows "1 of N".
+- [ ] Return / Cmd+G and Shift+Return / Cmd+Shift+G step through matches,
+      changing page when needed and scrolling the match into view.
+- [ ] Replace changes the highlighted match only, in the line's own font,
+      and moves to the next. Cmd+Z undoes it.
+- [ ] Replace All asks first (count, pages, warnings, skipped matches),
+      then changes everything; one Cmd+Z undoes all of it.
+- [ ] Esc or Done closes the bar and removes the highlights.
+- [ ] On a 100+ page PDF, the first search shows "Searching…" and later
+      ones are quick.
 
 ## Undo, history, saving
 

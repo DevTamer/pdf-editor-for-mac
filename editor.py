@@ -17,7 +17,9 @@ from pdfcore.frozen import configure_bundled_tcl_tk
 
 configure_bundled_tcl_tk()
 
+import contextlib  # noqa: E402
 import datetime  # noqa: E402
+import hashlib  # noqa: E402
 import json  # noqa: E402
 import math  # noqa: E402
 import re  # noqa: E402
@@ -25,9 +27,10 @@ import tempfile  # noqa: E402
 import tkinter as tk  # noqa: E402  (must follow configure_bundled_tcl_tk)
 from tkinter import colorchooser, filedialog, messagebox, ttk  # noqa: E402
 from tkinter import font as tkfont  # noqa: E402
-from typing import Callable, List, Optional, Tuple  # noqa: E402
+from typing import Callable, Dict, List, Optional, Tuple  # noqa: E402
 
 import pymupdf  # noqa: E402
+from PIL import Image, ImageTk  # noqa: E402
 
 from pdfcore import DocumentSession, PDFRenderer  # noqa: E402
 from pdfcore.pageview import PageView  # noqa: E402
@@ -37,10 +40,14 @@ from erase import (  # noqa: E402
     word_at, words_between,
 )
 import fontmatch  # noqa: E402
+from findreplace import (  # noqa: E402
+    Match, ReplaceAllPlan, find_on_page, match_rects, might_contain,
+    plan_replace, plan_replace_all, skipped_summary,
+)
 from textedit import (  # noqa: E402
     FAMILIES, MAX_SIZE, MIN_SIZE, AddPlan, EditError, EditPlan, TextRun,
     TextStyle,
-    apply_add_text, apply_edit, page_runs, plan_add_text, plan_edit,
+    apply_add_text, apply_edit, apply_edits, page_runs, plan_add_text, plan_edit,
     resolve_original_font, run_at,
 )
 
@@ -78,6 +85,12 @@ EDIT_BORDER = "#2f7ae5"
 MIN_EDITOR_WIDTH = 160  # px
 EDITOR_EXTRA_WIDTH = 60  # px of room to type beyond the original text
 ERASE_COLOR = "#e5484d"
+SELECTION_ALPHA = 0.35      # erase selection over words
+MARQUEE_ALPHA = 0.15        # erase rectangle
+FIND_ALPHA = 0.35           # find matches
+FIND_OTHER = "#f5b400"      # outlines of matches
+FIND_CURRENT = "#f76b15"    # the current match
+FIND_DELAY_MS = 250         # search once typing pauses this long
 MIN_MARQUEE = 4  # px: smaller drags count as clicks
 
 
@@ -179,6 +192,7 @@ class EditorModel(DocumentSession):
         super().__init__(history_limit=HISTORY_LIMIT)
         self._saved_entry = None
         self.save_path: Optional[str] = None
+        self._search_cache: dict = {}
 
     # -- Document lifecycle ---------------------------------------------------
 
@@ -186,6 +200,7 @@ class EditorModel(DocumentSession):
         # If this fails (unreadable or password-protected file), pdfcore
         # leaves the current document, its history and our state untouched.
         super().open_document(path)
+        self._search_cache = {}
         # Every undo step holds a full copy of the document: cap the count so
         # a big scan doesn't eat gigabytes of memory.
         size = max(1, len(self.history.current.doc_bytes))
@@ -195,6 +210,7 @@ class EditorModel(DocumentSession):
 
     def close_document(self) -> None:
         super().close_document()
+        self._search_cache = {}
         self._saved_entry = None
         self.save_path = None
 
@@ -256,7 +272,7 @@ class EditorModel(DocumentSession):
         page = self.get_page(run.page_num)
         return plan_edit(self.doc, page, run, new_text)
 
-    def apply_plan(self, plan: EditPlan) -> Optional[str]:
+    def apply_plan(self, plan: EditPlan, label: Optional[str] = None) -> Optional[str]:
         """Apply a plan from plan_edit(). Returns the new history label, or
         None if the plan changes nothing. Raises EditError (with the
         document restored to how it was) if the edit can't be made."""
@@ -264,7 +280,9 @@ class EditorModel(DocumentSession):
             return None
         if not plan.can_apply:
             raise EditError(plan.errors[0])
-        if plan.new_text.strip():
+        if label is not None:
+            pass
+        elif plan.new_text.strip():
             label = f"Edit “{_short(plan.run.text)}” → “{_short(plan.new_text)}”"
         else:
             label = f"Delete “{_short(plan.run.text)}”"
@@ -291,6 +309,91 @@ class EditorModel(DocumentSession):
         """Write new text with its top-left corner at ``top_left`` (PDF
         points). Raises EditError if it can't be added."""
         return self.apply_add(self.plan_add_text(page_num, top_left, text, style))
+
+    # -- Find and replace -----------------------------------------------------
+
+    def _page_cache(self, page_num: int) -> dict:
+        """Per-page text and runs for searching, kept while the page's
+        content is unchanged. (An edit changes one page; an undo or redo
+        loads a whole new document, but most pages come back the same.)"""
+        fingerprint = self._page_fingerprint(page_num)
+        cache = self._search_cache.get(page_num)
+        if cache is None or cache["fingerprint"] != fingerprint:
+            cache = self._search_cache[page_num] = {"fingerprint": fingerprint}
+        return cache
+
+    def _page_fingerprint(self, page_num: int) -> str:
+        """Changes whenever the page's text can have: a hash of its raw
+        (still compressed) content streams and its fonts."""
+        page = self.get_page(page_num)
+        digest = hashlib.sha1()
+        for xref in page.get_contents():
+            digest.update(self.doc.xref_stream_raw(xref) or b"")
+        digest.update(repr(page.get_fonts()).encode())
+        return digest.hexdigest()
+
+    def find(self, query: str, match_case: bool = False,
+             whole_word: bool = False) -> List[Match]:
+        """Every match, in reading order, without highlight boxes (see
+        match_rects)."""
+        matches = []
+        for page_num in range(self.page_count):
+            cache = self._page_cache(page_num)
+            if "text" not in cache:
+                cache["text"] = self.get_page(page_num).get_text()
+            if not might_contain(cache["text"], query):
+                continue
+            if "runs" not in cache:
+                cache["runs"] = self.runs(page_num)
+            matches.extend(find_on_page(self.get_page(page_num), page_num, query,
+                                        match_case, whole_word,
+                                        runs=cache["runs"], rects=False))
+        return matches
+
+    def match_rects(self, matches: List[Match]) -> List[Match]:
+        """The matches, all on one page, with their highlight boxes."""
+        if not matches:
+            return []
+        return match_rects(self.get_page(matches[0].page_num), matches)
+
+    def plan_replace(self, match: Match, replacement: str) -> EditPlan:
+        return plan_replace(self.doc, match, replacement)
+
+    def apply_replace(self, plan: EditPlan, match: Match, replacement: str) -> str:
+        """Apply plan_replace()'s plan as one undo step."""
+        return self.apply_plan(
+            plan, f"Replace “{_short(match.text)}” → “{_short(replacement)}”")
+
+    def plan_replace_all(self, matches: List[Match], replacement: str,
+                         query: str = "") -> ReplaceAllPlan:
+        return plan_replace_all(self.doc, matches, replacement, query)
+
+    def apply_replace_all(self, plan: ReplaceAllPlan) -> str:
+        """Make every replacement as one undo step. If any line can't be
+        changed and verified, none are: the document is restored and
+        EditError says which line."""
+        if not plan.plans:
+            raise EditError("There's nothing to replace.")
+
+        by_page: Dict[int, List[EditPlan]] = {}
+        for edit in plan.plans:
+            by_page.setdefault(edit.run.page_num, []).append(edit)
+
+        def apply_all():
+            # One pass per page: removal and verification for all its lines
+            # at once (one at a time is ~30 ms a line).
+            for page_num, edits in sorted(by_page.items()):
+                try:
+                    apply_edits(self.get_page(page_num), edits)
+                except EditError as exc:
+                    raise EditError(
+                        f"Nothing was replaced: page {page_num + 1} couldn't "
+                        f"be changed. {exc}") from exc
+
+        count = plan.count
+        return self._change(
+            apply_all, f"Replace all “{_short(plan.query)}” → "
+                       f"“{_short(plan.replacement)}” ({count})")
 
     def erase(self, plan: ErasePlan) -> str:
         """Erase words or an area (see erase.py). Raises EditError if
@@ -378,6 +481,7 @@ class EditCanvas(PageView):
         self.adding_at: Optional[Tuple[int, Tuple[float, float]]] = None
         self.entry: Optional[tk.Entry] = None
         self._tk_families: Optional[set] = None
+        self._tints: dict = {}            # translucent images, by size and colour
         self._on_commit = self._on_cancel = lambda: None
         # Erase drag state
         self._anchor_word: Optional[Word] = None
@@ -512,19 +616,39 @@ class EditCanvas(PageView):
             return None
         return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
 
+    def tint(self, box, color: str, alpha: float, tag: str) -> None:
+        """A see-through coloured rectangle over the page.
+
+        Tk on macOS ignores stipple patterns, so a "half-filled" rectangle
+        is drawn solid and hides the text under it. A translucent image
+        doesn't."""
+        x0, y0, x1, y1 = (round(v) for v in box)
+        size = (max(1, x1 - x0), max(1, y1 - y0))
+        key = (size, color, alpha)
+        image = self._tints.get(key)
+        if image is None:
+            red, green, blue = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+            image = ImageTk.PhotoImage(
+                Image.new("RGBA", size, (red, green, blue, round(alpha * 255))),
+                master=self.canvas)
+            if len(self._tints) > 500:
+                self._tints.clear()        # sizes change as the user drags
+            self._tints[key] = image
+        self.canvas.create_image(x0, y0, anchor="nw", image=image, tags=(tag,))
+
     def _draw_selection(self, xy) -> None:
         self.canvas.delete("erase_sel")
         if self._anchor_word is not None:
             for word in self.selection:
-                self.canvas.create_rectangle(
-                    *self._canvas_box(word.bbox, 1), fill=ERASE_COLOR,
-                    stipple="gray50", outline="", tags=("erase_sel",))
+                self.tint(self._canvas_box(word.bbox, 1), ERASE_COLOR,
+                          SELECTION_ALPHA, "erase_sel")
         else:
             box = self._marquee(xy)
             if box is not None:
+                self.tint(box, ERASE_COLOR, MARQUEE_ALPHA, "erase_sel")
                 self.canvas.create_rectangle(
                     *box, outline=ERASE_COLOR, dash=(4, 3), width=1.5,
-                    fill=ERASE_COLOR, stipple="gray25", tags=("erase_sel",))
+                    tags=("erase_sel",))
 
     def _finish_erase_drag(self, xy) -> None:
         words = list(self.selection)
@@ -670,6 +794,7 @@ class EditorWindow:
 
         self._build_menu()
         self._build_toolbar()
+        self._build_find_bar()
         self._build_main_area()
         self._build_status_bar()
 
@@ -702,6 +827,10 @@ class EditorWindow:
         win.bind("<Return>", self._on_return_key)
         win.bind("<KP_Enter>", self._on_return_key)
         win.bind("<Escape>", self._on_escape_key)
+        win.bind("<Command-f>", self.show_find_bar)
+        win.bind("<Command-g>", self._find_next)
+        win.bind("<Command-Shift-g>", self._find_prev)
+        win.bind("<Command-Shift-G>", self._find_prev)
         win.protocol("WM_DELETE_WINDOW", self._on_close_window)
 
         self._show_tool_panel()
@@ -763,6 +892,13 @@ class EditorWindow:
                                    accelerator="Cmd+Z")
         self.edit_menu.add_command(label="Redo", command=self._on_redo,
                                    accelerator="Cmd+Shift+Z")
+        self.edit_menu.add_separator()
+        self.edit_menu.add_command(label="Find & Replace…",
+                                   command=self.show_find_bar, accelerator="Cmd+F")
+        self.edit_menu.add_command(label="Find Next", command=self._find_next,
+                                   accelerator="Cmd+G")
+        self.edit_menu.add_command(label="Find Previous", command=self._find_prev,
+                                   accelerator="Cmd+Shift+G")
 
         tools_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Tools", menu=tools_menu)
@@ -776,6 +912,7 @@ class EditorWindow:
     def _build_toolbar(self) -> None:
         toolbar = ttk.Frame(self.window, padding=(5, 3))
         toolbar.pack(side="top", fill="x")
+        self.toolbar = toolbar
 
         ttk.Button(toolbar, text="Open", command=self._on_open,
                    width=6).pack(side="left", padx=(0, 2))
@@ -813,6 +950,303 @@ class EditorWindow:
         self.page_entry.pack(side="left", padx=(0, 3))
         self.page_entry.bind("<Return>", self._on_page_jump)
         self.page_entry.bind("<KP_Enter>", self._on_page_jump)
+
+    # -- Find and replace bar ----------------------------------------------------
+
+    def _build_find_bar(self) -> None:
+        """Hidden until Edit > Find & Replace (Cmd+F)."""
+        bar = ttk.Frame(self.window, padding=(5, 2))
+        self.find_bar = bar
+        self.find_var = tk.StringVar(self.window)
+        self.replace_var = tk.StringVar(self.window)
+        self.match_case_var = tk.BooleanVar(self.window, value=False)
+        self.whole_word_var = tk.BooleanVar(self.window, value=False)
+        self.matches: List[Match] = []
+        self.match_index = -1
+        self._find_job = None
+
+        ttk.Label(bar, text="Find").pack(side="left")
+        self.find_entry = ttk.Entry(bar, textvariable=self.find_var, width=22)
+        self.find_entry.pack(side="left", padx=(4, 8))
+        ttk.Label(bar, text="Replace with").pack(side="left")
+        self.replace_entry = ttk.Entry(bar, textvariable=self.replace_var, width=22)
+        self.replace_entry.pack(side="left", padx=(4, 8))
+        ttk.Checkbutton(bar, text="Match case", variable=self.match_case_var,
+                        command=lambda: self._refind(jump=True)).pack(side="left")
+        ttk.Checkbutton(bar, text="Whole words", variable=self.whole_word_var,
+                        command=lambda: self._refind(jump=True)).pack(side="left",
+                                                                      padx=(4, 8))
+        self.find_prev_btn = ttk.Button(bar, text="◀", width=2, command=self._find_prev)
+        self.find_prev_btn.pack(side="left")
+        self.find_next_btn = ttk.Button(bar, text="▶", width=2, command=self._find_next)
+        self.find_next_btn.pack(side="left", padx=(0, 8))
+        self.replace_btn = ttk.Button(bar, text="Replace", command=self._replace_current)
+        self.replace_btn.pack(side="left")
+        self.replace_all_btn = ttk.Button(bar, text="Replace All",
+                                          command=self._replace_all)
+        self.replace_all_btn.pack(side="left", padx=(4, 8))
+        self.find_count = ttk.Label(bar, text="", width=16)
+        self.find_count.pack(side="left")
+        ttk.Button(bar, text="Done", command=self.hide_find_bar,
+                   width=5).pack(side="right")
+
+        # These fields handle their own Return and Esc ("break"), so the
+        # window's Return/Esc (for the inline text box) never sees them.
+        for widget in (self.find_entry, self.replace_entry):
+            widget.bind("<Escape>", self._find_escape)
+        for key in ("<Return>", "<KP_Enter>"):
+            self.find_entry.bind(key, self._find_return)
+            self.replace_entry.bind(key, self._replace_return)
+        self.find_entry.bind("<Shift-Return>", self._find_shift_return)
+        self.find_var.trace_add("write", lambda *a: self._schedule_find())
+        self._update_find_controls()
+
+    @property
+    def find_bar_shown(self) -> bool:
+        return bool(self.find_bar.winfo_manager())
+
+    def show_find_bar(self, event=None) -> None:
+        if not self.find_bar_shown:
+            self.find_bar.pack(side="top", fill="x", after=self.toolbar)
+        self.find_entry.focus_set()
+        self.find_entry.select_range(0, "end")
+        self._refind()
+
+    def hide_find_bar(self) -> None:
+        if self._find_job:
+            self.window.after_cancel(self._find_job)
+            self._find_job = None
+        self.find_bar.pack_forget()
+        self.matches, self.match_index = [], -1
+        self.canvas.delete("find")
+        self.canvas.focus_set()
+
+    def _find_return(self, event=None) -> str:
+        self._find_next()
+        return "break"
+
+    def _find_shift_return(self, event=None) -> str:
+        self._find_prev()
+        return "break"
+
+    def _replace_return(self, event=None) -> str:
+        self._replace_current()
+        return "break"
+
+    def _find_escape(self, event=None) -> str:
+        self.hide_find_bar()
+        return "break"
+
+    def _schedule_find(self) -> None:
+        """Search as you type, once typing pauses."""
+        if self._find_job:
+            self.window.after_cancel(self._find_job)
+        self._find_job = self.window.after(FIND_DELAY_MS, self._run_scheduled_find)
+
+    def _run_scheduled_find(self) -> None:
+        self._find_job = None
+        self._refind(jump=True)
+
+    def _refind(self, jump: bool = False) -> None:
+        """Search again (the text, options or document changed). Keeps
+        the current match where it was, or picks the first one from the
+        current page on; ``jump`` also shows it."""
+        query = self.find_var.get()
+        if not (self.find_bar_shown and self.model.doc and query):
+            self.matches, self.match_index = [], -1
+            self._update_find_controls()
+            self._draw_find_highlights()
+            return
+        previous = (self.matches[self.match_index]
+                    if 0 <= self.match_index < len(self.matches) else None)
+        with self._busy("Searching…" if self.model.page_count > 20 else None):
+            self.matches = self.model.find(query, self.match_case_var.get(),
+                                           self.whole_word_var.get())
+        if previous is not None and not jump:
+            here = previous.order
+        else:
+            here = (self.model.current_page,)
+        self.match_index = next(
+            (i for i, m in enumerate(self.matches) if m.order >= here),
+            0 if self.matches else -1)
+        self._update_find_controls()
+        if jump and self.matches:
+            self._show_match()
+        else:
+            self._draw_find_highlights()
+
+    def _update_find_controls(self) -> None:
+        n = len(self.matches)
+        if not self.find_var.get():
+            text = ""
+        elif n == 0:
+            text = "No matches"
+        else:
+            text = f"{self.match_index + 1} of {n}"
+        self.find_count.config(text=text)
+        state = "normal" if n else "disabled"
+        for button in (self.find_prev_btn, self.find_next_btn,
+                       self.replace_btn, self.replace_all_btn):
+            button.config(state=state)
+
+    def _find_next(self, event=None) -> None:
+        self._step_match(+1)
+
+    def _find_prev(self, event=None) -> None:
+        self._step_match(-1)
+
+    def _flush_find(self) -> bool:
+        """Run a search still waiting for typing to pause, now, so a quick
+        Return isn't undone by it a moment later. True if one ran."""
+        if not self._find_job:
+            return False
+        self.window.after_cancel(self._find_job)
+        self._find_job = None
+        self._refind(jump=True)
+        return True
+
+    def _step_match(self, step: int) -> None:
+        if not self.find_bar_shown:
+            self.show_find_bar()
+            return
+        if self._flush_find():
+            return                  # it just showed the first match
+        if not self.matches:
+            self._refind(jump=True)
+            return
+        self.match_index = (self.match_index + step) % len(self.matches)
+        self._update_find_controls()
+        self._show_match()
+
+    def _show_match(self) -> None:
+        """Go to the current match's page and scroll it into view."""
+        match = self.matches[self.match_index]
+        if match.page_num != self.model.current_page:
+            self._go_to_page(match.page_num)
+            if self.model.current_page != match.page_num:
+                return                     # the open text box couldn't be applied
+        self._draw_find_highlights()
+        x0, y0, x1, y1 = self.view._canvas_box(self._rect_of(self.match_index))
+        height = self.view.display_size[1] or 1
+        top, bottom = (f * height for f in self.canvas.yview())
+        if y0 < top or y1 > bottom:
+            self.canvas.yview_moveto(max(0.0, (y0 - 60) / height))
+
+    def _draw_find_highlights(self) -> None:
+        """Highlight the matches on the page shown (translucent, so the
+        text stays readable); the current one is also outlined."""
+        self.canvas.delete("find")
+        if not self.find_bar_shown or not self.model.doc:
+            return
+        for i, match in enumerate(self.matches):
+            if match.page_num != self.model.current_page:
+                continue
+            box = self.view._canvas_box(self._rect_of(i), 1)
+            self.view.tint(box, FIND_OTHER, FIND_ALPHA, "find")
+            if i == self.match_index:
+                self.canvas.create_rectangle(*box, outline=FIND_CURRENT, width=2,
+                                             tags=("find",))
+
+    @contextlib.contextmanager
+    def _busy(self, status: Optional[str]):
+        """Show a wait cursor (and ``status``) during something slow."""
+        if status is None:
+            yield
+            return
+        previous = self.status_label["text"]
+        self._set_status(status)
+        self.window.configure(cursor="watch")
+        self.window.update_idletasks()
+        try:
+            yield
+        finally:
+            self.window.configure(cursor="")
+            if self.status_label["text"] == status:
+                self._set_status(previous)
+
+    def _rect_of(self, index: int):
+        """A match's highlight box. Boxes are worked out a page at a time,
+        when that page is shown (they're slow to get for a whole PDF)."""
+        match = self.matches[index]
+        if match.rect is None:
+            page = [i for i, m in enumerate(self.matches)
+                    if m.page_num == match.page_num and m.rect is None]
+            for i, boxed in zip(page, self.model.match_rects(
+                    [self.matches[i] for i in page])):
+                self.matches[i] = boxed
+        return self.matches[index].rect
+
+    def _replace_current(self) -> None:
+        if self.view.entry is not None and not self._commit_inline_edit():
+            return
+        if self._flush_find():
+            return                  # show the first match before replacing it
+        if not (0 <= self.match_index < len(self.matches)):
+            return
+        match = self.matches[self.match_index]
+        if match.page_num != self.model.current_page:
+            self._show_match()             # show it first; Replace again replaces
+            return
+        replacement = self.replace_var.get()
+        plan = self.model.plan_replace(match, replacement)
+        if plan.is_noop:
+            self._find_next()
+            return
+        if not plan.can_apply:
+            self._show_error("Can't Replace This", "\n\n".join(plan.errors))
+            return
+        if plan.warnings and not messagebox.askokcancel(
+                "Replace", "\n\n".join(plan.warnings) + "\n\nReplace anyway?",
+                icon="warning", parent=self.window):
+            return
+        try:
+            label = self.model.apply_replace(plan, match, replacement)
+        except EditError as exc:
+            self._after_failure(exc, "Replace Failed")
+            return
+        self._after_change(label, match.page_num)   # finds again, from here on
+        if self.matches:
+            self._show_match()
+
+    def _replace_all(self) -> None:
+        if self.view.entry is not None and not self._commit_inline_edit():
+            return
+        if self._find_job:
+            self.window.after_cancel(self._find_job)
+            self._find_job = None
+        self._refind()
+        query, replacement = self.find_var.get(), self.replace_var.get()
+        if not self.matches:
+            return
+        with self._busy("Checking each replacement…"):
+            plan = self.model.plan_replace_all(self.matches, replacement, query)
+        skipped = skipped_summary(plan)
+        if not plan.plans:
+            self._show_error("Can't Replace",
+                             "None of the matches can be replaced:\n\n"
+                             + "\n".join(skipped))
+            return
+        pages = len(plan.pages)
+        message = (f"Replace {plan.count} occurrence{'s' if plan.count != 1 else ''}"
+                   f" of “{query}” with “{replacement}” on {pages} "
+                   f"page{'s' if pages != 1 else ''}?")
+        if plan.warnings:
+            message += "\n\n" + "\n\n".join(plan.warnings)
+        if skipped:
+            message += ("\n\nThese will be left as they are:\n"
+                        + "\n".join(skipped))
+        message += "\n\nThis is one step: Undo puts everything back."
+        if not messagebox.askokcancel("Replace All", message, parent=self.window,
+                                      icon="warning" if plan.warnings else "info"):
+            return
+        try:
+            with self._busy(f"Replacing {plan.count}…"):
+                label = self.model.apply_replace_all(plan)
+        except EditError as exc:
+            self._after_failure(exc, "Replace All Failed")
+            return
+        self.renderer.invalidate()                   # several pages changed
+        self._after_change(label, self.model.current_page)
 
     def _build_main_area(self) -> None:
         main = ttk.PanedWindow(self.window, orient="horizontal")
@@ -1047,6 +1481,7 @@ class EditorWindow:
         if not self.model.doc:
             return
         self.view.display_page(self.model.current_page)
+        self._draw_find_highlights()
         self._update_ui_state()
 
     def _after_change(self, label: Optional[str], page_num: int) -> None:
@@ -1054,11 +1489,13 @@ class EditorWindow:
         self._refresh_page()
         self._update_history_list()
         self._set_status(label or "No change")
+        self._refind()
 
     def _after_failure(self, exc: Exception, title: str) -> None:
         self.renderer.invalidate()
         self._refresh_page()
         self._update_history_list()
+        self._refind()
         self._show_error(title, str(exc))
 
     def _set_status(self, text: str) -> None:
@@ -1238,6 +1675,7 @@ class EditorWindow:
         self.info_label.config(text="Nothing selected", foreground="gray")
         self._set_status(f"Opened {os.path.basename(path)} — click any text "
                          "to edit it")
+        self._refind()
         return True
 
     def _on_open(self) -> None:
@@ -1310,6 +1748,7 @@ class EditorWindow:
         self.renderer.invalidate()
         self.canvas.delete("all")
         self._update_history_list()
+        self._refind()
         self.info_label.config(text="Nothing selected", foreground="gray")
         self._set_status("Ready — open a PDF to begin")
         self._update_ui_state()
@@ -1401,6 +1840,7 @@ class EditorWindow:
         self.renderer.invalidate()
         self._refresh_page()
         self._update_history_list()
+        self._refind()
         self._set_status(f"{verb} — now at: {label}")
 
     def _typing_elsewhere(self) -> bool:

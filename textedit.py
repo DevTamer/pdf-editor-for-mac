@@ -1001,20 +1001,34 @@ def apply_edit(page: pymupdf.Page, plan: EditPlan) -> None:
     verified. In that case the page may be partly modified, and the caller
     must restore it (e.g. from the last undo snapshot).
     """
-    if not plan.can_apply:
-        raise EditError(plan.errors[0])
-    if plan.is_noop:
+    apply_edits(page, [plan])
+
+
+def apply_edits(page: pymupdf.Page, plans: List[EditPlan]) -> None:
+    """Replace several runs on one page at once (Replace All), with one
+    removal pass and one verification for them all, as strict as for a
+    single edit: every other character on the page must be unchanged, and
+    each new text must read back where it was written."""
+    for plan in plans:
+        if not plan.can_apply:
+            raise EditError(plan.errors[0])
+    plans = [p for p in plans if not p.is_noop]
+    if not plans:
         return
-    run = plan.run
+    page_num = plans[0].run.page_num
+    current = page_runs(page, page_num)
+    for plan in plans:
+        if not any(r.same_as(plan.run) for r in current):
+            raise EditError("That text has changed since it was selected. "
+                            "Click it again to edit it.")
 
-    if not any(r.same_as(run) for r in page_runs(page, run.page_num)):
-        raise EditError("That text has changed since it was selected. "
-                        "Click it again to edit it.")
-
-    expected_after_removal = _char_counts(page) - _counted(run.text)
+    expected_after_removal = _char_counts(page)
+    for plan in plans:
+        expected_after_removal -= _counted(plan.run.text)
     annotations = annotation_inventory(page)
 
-    page.add_redact_annot(removal_rect(run), fill=False)
+    for plan in plans:
+        page.add_redact_annot(removal_rect(plan.run), fill=False)
     page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
                           graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
     check_annotations_kept(page, annotations)
@@ -1022,12 +1036,16 @@ def apply_edit(page: pymupdf.Page, plan: EditPlan) -> None:
         raise EditError("Removing the old text would also have changed "
                         "nearby text, so the edit was cancelled.")
 
-    if plan.segments:
-        write_text(page, run.origin, writing_fonts(plan.segments),
-                   run.size, run.color)
+    expected = expected_after_removal
+    for plan in plans:
+        if plan.segments:
+            write_text(page, plan.run.origin, writing_fonts(plan.segments),
+                       plan.run.size, plan.run.color)
+        expected += _counted(plan.new_text)
 
-    if (_char_counts(page) != expected_after_removal + _counted(plan.new_text)
-            or not _reads_back(page, plan)):
+    runs_after = page_runs(page, page_num)
+    if (_char_counts(page) != expected
+            or not all(_reads_back(page, plan, runs_after) for plan in plans)):
         raise EditError("The new text couldn't be verified after writing "
                         "it, so the edit was cancelled.")
 
@@ -1036,7 +1054,8 @@ def _collapse(text: str) -> str:
     return " ".join(text.split())
 
 
-def _reads_back(page: pymupdf.Page, plan: EditPlan) -> bool:
+def _reads_back(page: pymupdf.Page, plan: EditPlan,
+                runs: Optional[List[TextRun]] = None) -> bool:
     """Whether the new text extracts, in order, on the run's baseline where
     it was written. (Character counts alone can't see reordering.)"""
     wanted = _collapse(plan.new_text)
@@ -1044,7 +1063,9 @@ def _reads_back(page: pymupdf.Page, plan: EditPlan) -> bool:
         return True
     x0 = plan.run.origin[0]
     x1 = x0 + plan.new_width
-    for run in page_runs(page, plan.run.page_num):
+    if runs is None:
+        runs = page_runs(page, plan.run.page_num)
+    for run in runs:
         if (abs(run.origin[1] - plan.run.origin[1]) <= SAME_LINE_TOLERANCE
                 and run.bbox[0] < x1 and run.bbox[2] > x0
                 and wanted in _collapse(run.text)):

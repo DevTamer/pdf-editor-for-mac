@@ -1167,3 +1167,51 @@ def test_an_unrelated_edit_keeps_the_current_match(app):
     _type(app, "Quarterly Reporter")     # (letters the subset font has)
     _press(app, "<Return>")
     assert app.matches[app.match_index].run.text.strip() == LINE_BELOW
+
+
+# -- Find & Replace review findings ---------------------------------------------------
+
+def test_replace_with_text_containing_the_query_moves_on(app):
+    _search(app, "line")
+    app.replace_var.set("lines")
+    for _ in range(3):
+        app._replace_current()
+    text = _page_text(app)
+    assert "The lines above the target" in text
+    assert "Target lines to edit" in text
+    assert "The lines below the target" in text
+    assert "liness" not in text
+
+
+def test_typing_a_search_doesnt_apply_a_half_typed_edit(app):
+    _click(app, TARGET)
+    _type(app, "Target line half-ty")
+    app.show_find_bar()
+    app.find_var.set("Second")                     # only on page 2
+    app._run_scheduled_find()                      # typing paused
+    assert app.view.entry is not None              # still typing in the box
+    assert app.model.current_page == 0
+    assert app.history_list.size() == 1
+    assert app.find_count["text"] == "1 of 1"
+
+
+def test_closing_a_window_cancels_its_pending_search(app, editor_app):
+    second = editor_app.new_window()
+    second.show_find_bar()
+    second.find_var.set("x")                       # search pending
+    job = second._find_job
+    assert job
+    second._on_close_window()
+    pending = app.window.tk.splitlist(app.window.tk.call("after", "info"))
+    assert job not in pending
+
+
+def test_many_drag_sizes_dont_blank_highlights_on_screen(app):
+    _search(app, "line")
+    names = {app.canvas.itemcget(i, "image") for i in app.canvas.find_withtag("find")
+             if app.canvas.type(i) == "image"}
+    for size in range(510):                        # an erase drag, many sizes
+        app.view.tint((0, 0, 10 + size, 10), editor.ERASE_COLOR, 0.2, "scratch")
+        app.canvas.delete("scratch")
+    alive = set(app.window.tk.splitlist(app.window.tk.call("image", "names")))
+    assert names <= alive

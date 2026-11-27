@@ -1032,7 +1032,15 @@ def apply_edits(page: pymupdf.Page, plans: List[EditPlan]) -> None:
     page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
                           graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
     check_annotations_kept(page, annotations)
-    if _char_counts(page) != expected_after_removal:
+    # Every line that isn't being replaced must still be there, exactly
+    # as it was. (Counting the page's characters alone could let one
+    # wrongly removed character hide one that should have gone but
+    # didn't.)
+    after_removal = page_runs(page, page_num)
+    untouched = [r for r in current
+                 if not any(r.same_as(p.run) for p in plans)]
+    if (_char_counts(page) != expected_after_removal
+            or not all(any(r.same_as(a) for a in after_removal) for r in untouched)):
         raise EditError("Removing the old text would also have changed "
                         "nearby text, so the edit was cancelled.")
 

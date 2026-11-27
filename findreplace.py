@@ -26,7 +26,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import pymupdf
 
-from textedit import EditPlan, TextRun, page_runs, plan_edit
+from textedit import EditPlan, TextRun, page_runs, plan_edit, removal_rect
 
 # What extraction shows -> what a search should see.
 _FOLD = {
@@ -214,11 +214,13 @@ def plan_replace_all(doc: pymupdf.Document, matches: List[Match],
     """One edit per line that has matches. Lines whose edit can't be made
     (rotated page, a comment over them...) are listed as skipped."""
     result = ReplaceAllPlan(query=query, replacement=replacement)
-    by_run: Dict[tuple, List[Match]] = {}
+    # Grouped by the run itself, not its text and position: text drawn
+    # twice in one place is two runs, each replaced once.
+    by_run: Dict[int, List[Match]] = {}
     for match in matches:
-        key = (match.page_num, match.run.text, match.run.bbox)
-        by_run.setdefault(key, []).append(match)
+        by_run.setdefault(id(match.run), []).append(match)
     runs_by_page: Dict[int, List[TextRun]] = {}
+    planned: Dict[int, List[Tuple[EditPlan, List[Match]]]] = {}
     for group in by_run.values():
         run = group[0].run
         page = doc[run.page_num]
@@ -231,9 +233,48 @@ def plan_replace_all(doc: pymupdf.Document, matches: List[Match],
         if not plan.can_apply:
             result.skipped.extend((m, plan.errors[0]) for m in group)
             continue
-        result.plans.append(plan)
-        result.counts.append(len(group))
+        planned.setdefault(run.page_num, []).append((plan, group))
+
+    for page_num, entries in sorted(planned.items()):
+        # A line whose removal would also take characters of text that
+        # isn't being replaced would fail verification and with it the
+        # whole Replace All: leave it out now, and say why.
+        hits = _bands_hitting_other_text(doc[page_num], runs_by_page[page_num],
+                                         [plan for plan, _g in entries])
+        for plan, group in entries:
+            if id(plan) in hits:
+                result.skipped.extend((m, OVERLAP_ERROR) for m in group)
+            else:
+                result.plans.append(plan)
+                result.counts.append(len(group))
     return result
+
+
+OVERLAP_ERROR = ("This line overlaps other text, so it can't be changed "
+                 "without touching that text.")
+
+
+def _bands_hitting_other_text(page: pymupdf.Page, runs: List[TextRun],
+                              plans: List[EditPlan]) -> set:
+    """ids of the plans whose removal band touches a character of a run
+    that no plan replaces."""
+    replaced = [p.run for p in plans]
+    others = [r for r in runs if not any(r.same_as(p) for p in replaced)]
+    if not others:
+        return set()
+    boxes = _char_boxes(page)
+    other_chars = []
+    for run in others:
+        for piece in run.pieces:
+            chars = boxes.get((piece.text, tuple(round(v, 1) for v in piece.bbox)), ())
+            other_chars.extend(pymupdf.Rect(b) for b, c in zip(chars, piece.text)
+                               if not c.isspace())
+    hits = set()
+    for plan in plans:
+        band = removal_rect(plan.run)
+        if any(band.intersects(c) for c in other_chars):
+            hits.add(id(plan))
+    return hits
 
 
 def skipped_summary(plan: ReplaceAllPlan) -> List[str]:

@@ -100,42 +100,108 @@ def _current_umask() -> int:
     return mask
 
 
-def _xmp_now() -> str:
-    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+def _now() -> datetime.datetime:
+    return datetime.datetime.now().astimezone()
 
 
-_XMP_DATES = re.compile(
-    r"(xmp:(?:ModifyDate|MetadataDate)\s*=\s*[\"'])[^\"']*([\"'])"   # attribute
-    r"|(<xmp:(?:ModifyDate|MetadataDate)>)[^<]*(</xmp:)")         # element
+def pdf_date(when: datetime.datetime) -> str:
+    """A PDF date string, "D:YYYYMMDDHHmmSS+HH'mm'", with the offset
+    worked out from ``when`` itself. (pymupdf.get_pdf_now() always uses
+    the daylight-saving offset, so it's an hour out in winter.)"""
+    offset = when.utcoffset() or datetime.timedelta(0)
+    minutes = int(offset.total_seconds() // 60)
+    sign = "+" if minutes >= 0 else "-"
+    hours, mins = divmod(abs(minutes), 60)
+    return f"D:{when:%Y%m%d%H%M%S}{sign}{hours:02d}'{mins:02d}'"
 
 
-def update_modification_date(doc: pymupdf.Document) -> None:
+def xmp_date(when: datetime.datetime) -> str:
+    return when.isoformat(timespec="seconds")
+
+
+XMP_BASIC_NS = "http://ns.adobe.com/xap/1.0/"
+# Sections describing *other* resources (placed images, fonts, earlier
+# versions), whose dates aren't the document's.
+_XMP_SKIP = re.compile(
+    r"<(xmpMM:(?:Pantry|Ingredients|History|DerivedFrom|Manifest))\b.*?"
+    r"(?:</\1>|/>)", re.S)
+
+
+def _xmp_date_pattern(xmp: str) -> Optional["re.Pattern"]:
+    """The document's ModifyDate/MetadataDate, as attributes or elements,
+    under whichever prefixes this XMP binds to the XMP basic namespace
+    (usually "xmp", "xap" in Acrobat 4-5 files), or as unprefixed elements
+    declaring it as their default namespace. None if there are none."""
+    prefixes = set(re.findall(r'xmlns:([A-Za-z_][\w.-]*)\s*=\s*["\']'
+                              + re.escape(XMP_BASIC_NS) + r'["\']', xmp))
+    alternatives = []
+    if prefixes:
+        p = "(?:" + "|".join(re.escape(x) for x in sorted(prefixes)) + ")"
+        name = rf"{p}:(?:ModifyDate|MetadataDate)"
+        alternatives.append(rf"(?<![\w:.-])(?P<a>{name}\s*=\s*(?P<q>[\"']))[^\"']*(?P=q)")
+        alternatives.append(rf"(?P<e><(?P<n>{name})(?:\s[^>]*)?>)[^<]*(?P<ee></(?P=n)>)")
+    alternatives.append(
+        r"(?P<d><(?P<dn>ModifyDate|MetadataDate)\s+xmlns\s*=\s*[\"']"
+        + re.escape(XMP_BASIC_NS) + r"[\"']\s*>)[^<]*(?P<de></(?P=dn)>)")
+    return re.compile("|".join(alternatives))
+
+
+def update_xmp_dates(xmp: str, when: datetime.datetime) -> str:
+    """``xmp`` with the document's ModifyDate and MetadataDate set to
+    ``when``; everything else, byte for byte, as it was. Dates of other
+    resources (in xmpMM:Pantry, Ingredients...) and look-alike names in
+    other namespaces ("myxmp:ModifyDate") are left alone."""
+    skip = [m.span() for m in _XMP_SKIP.finditer(xmp)]
+    stamp = xmp_date(when)
+
+    def replace(m):
+        if any(a <= m.start() < b for a, b in skip):
+            return m.group(0)
+        g = m.groupdict()          # (the prefixed groups exist only if bound)
+        if g.get("a"):
+            return f"{g['a']}{stamp}{g['q']}"
+        if g.get("e"):
+            return f"{g['e']}{stamp}{g['ee']}"
+        return f"{g['d']}{stamp}{g['de']}"
+    return _xmp_date_pattern(xmp).sub(replace, xmp)
+
+
+def update_modification_date(doc: pymupdf.Document,
+                             when: Optional[datetime.datetime] = None) -> None:
     """Set the document's modification date to now, in the Info
     dictionary and the XMP metadata, changing nothing else (Producer,
-    Creator, custom fields all stay). A PDF without either gets none."""
+    Creator, custom fields all stay). A PDF without either gets none, and
+    a damaged /Info (not a dictionary) is left alone rather than stopping
+    the save."""
+    when = when or _now()
+    stamp = f"({pdf_date(when)})"
     kind, value = doc.xref_get_key(-1, "Info")
     if kind == "xref":
         info = int(value.split()[0])
-        doc.xref_set_key(info, "ModDate", f"({pymupdf.get_pdf_now()})")
+        if doc.xref_object(info, compressed=True).lstrip().startswith("<<"):
+            doc.xref_set_key(info, "ModDate", stamp)
+    elif kind == "dict":
+        doc.xref_set_key(-1, "Info/ModDate", stamp)
     xmp = doc.get_xml_metadata()
     if xmp:
-        now = _xmp_now()
-        doc.set_xml_metadata(_XMP_DATES.sub(
-            lambda m: (f"{m.group(1)}{now}{m.group(2)}" if m.group(1)
-                       else f"{m.group(3)}{now}{m.group(4)}"), xmp))
+        doc.set_xml_metadata(update_xmp_dates(xmp, when))
 
 
 def remove_document_info(doc: pymupdf.Document) -> None:
     """Remove the document info (title, author, dates, creator, producer
     and any custom fields), all XMP metadata, and applications' private
-    data (/PieceInfo, which can hold a copy of the original content)."""
+    data (/PieceInfo, which can hold a copy of the original content, on
+    the catalog, pages and embedded graphics alike)."""
     doc.scrub(attached_files=False, clean_pages=False, embedded_files=False,
               hidden_text=False, javascript=False, metadata=True,
               redactions=False, remove_links=False, reset_fields=False,
               reset_responses=False, thumbnails=False, xml_metadata=True)
-    for xref in [doc.pdf_catalog()] + [page.xref for page in doc]:
-        if doc.xref_get_key(xref, "PieceInfo")[0] != "null":
-            doc.xref_set_key(xref, "PieceInfo", "null")
+    for xref in range(1, doc.xref_length()):
+        try:
+            if doc.xref_get_key(xref, "PieceInfo")[0] != "null":
+                doc.xref_set_key(xref, "PieceInfo", "null")
+        except Exception:
+            continue          # a free or damaged object
 
 
 def load_settings() -> dict:
@@ -147,12 +213,17 @@ def load_settings() -> dict:
         return {}
 
 
-def save_settings(settings: dict) -> None:
-    """Best effort: a setting that can't be saved just isn't remembered."""
+def save_settings(changes: dict) -> None:
+    """Remember ``changes``, on top of whatever is saved (another copy of
+    the app may have saved other settings meanwhile). Best effort: a
+    setting that can't be saved just isn't remembered."""
     try:
-        os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
-        tmp = SETTINGS_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
+        directory = os.path.dirname(SETTINGS_PATH)
+        os.makedirs(directory, exist_ok=True)
+        settings = load_settings()
+        settings.update(changes)
+        fd, tmp = tempfile.mkstemp(suffix=".json", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(settings, fh)
         os.replace(tmp, SETTINGS_PATH)
     except OSError:
@@ -324,10 +395,16 @@ class EditorModel(DocumentSession):
 
     def _page_fingerprint(self, page_num: int) -> str:
         """Changes whenever the page's text can have: a hash of its raw
-        (still compressed) content streams and its fonts."""
+        (still compressed) content streams, those of the form XObjects it
+        draws (nested ones too: a redaction can move the page's text into
+        one, leaving the page's own stream identical for different edits),
+        and its fonts."""
         page = self.get_page(page_num)
         digest = hashlib.sha1()
         for xref in page.get_contents():
+            digest.update(self.doc.xref_stream_raw(xref) or b"")
+        for xref, *_ in page.get_xobjects():
+            digest.update(b"|%d|" % xref)
             digest.update(self.doc.xref_stream_raw(xref) or b"")
         digest.update(repr(page.get_fonts()).encode())
         return digest.hexdigest()
@@ -632,7 +709,13 @@ class EditCanvas(PageView):
                 Image.new("RGBA", size, (red, green, blue, round(alpha * 255))),
                 master=self.canvas)
             if len(self._tints) > 500:
-                self._tints.clear()        # sizes change as the user drags
+                # Sizes change as the user drags: let go of images no longer
+                # drawn (Tk blanks an image the moment it's let go).
+                in_use = {self.canvas.itemcget(i, "image")
+                          for i in self.canvas.find_all()
+                          if self.canvas.type(i) == "image"}
+                self._tints = {k: v for k, v in self._tints.items()
+                               if str(v) in in_use}
             self._tints[key] = image
         self.canvas.create_image(x0, y0, anchor="nw", image=image, tags=(tag,))
 
@@ -964,6 +1047,9 @@ class EditorWindow:
         self.matches: List[Match] = []
         self.match_index = -1
         self._find_job = None
+        # After a Replace: carry on searching after the inserted text, so
+        # a replacement that contains the search text isn't found again.
+        self._resume_at: Optional[tuple] = None
 
         ttk.Label(bar, text="Find").pack(side="left")
         self.find_entry = ttk.Entry(bar, textvariable=self.find_var, width=22)
@@ -1045,7 +1131,10 @@ class EditorWindow:
 
     def _run_scheduled_find(self) -> None:
         self._find_job = None
-        self._refind(jump=True)
+        # Don't leave the page while a text box is open: going to another
+        # page would apply the half-typed edit. (Return or Next, asked for
+        # explicitly, still go.)
+        self._refind(jump=self.view.entry is None)
 
     def _refind(self, jump: bool = False) -> None:
         """Search again (the text, options or document changed). Keeps
@@ -1062,7 +1151,9 @@ class EditorWindow:
         with self._busy("Searching…" if self.model.page_count > 20 else None):
             self.matches = self.model.find(query, self.match_case_var.get(),
                                            self.whole_word_var.get())
-        if previous is not None and not jump:
+        if self._resume_at is not None:
+            here, self._resume_at = self._resume_at, None
+        elif previous is not None and not jump:
             here = previous.order
         else:
             here = (self.model.current_page,)
@@ -1204,7 +1295,9 @@ class EditorWindow:
         except EditError as exc:
             self._after_failure(exc, "Replace Failed")
             return
-        self._after_change(label, match.page_num)   # finds again, from here on
+        page, y, x, start = match.order
+        self._resume_at = (page, y, x, start + len(replacement))
+        self._after_change(label, match.page_num)   # finds again, from there on
         if self.matches:
             self._show_match()
 
@@ -1766,6 +1859,9 @@ class EditorWindow:
         if self._resize_job:
             self.window.after_cancel(self._resize_job)
             self._resize_job = None
+        if self._find_job:
+            self.window.after_cancel(self._find_job)
+            self._find_job = None
         self.view.cancel_inline_edit()
         self.model.close_document()
         self.window.destroy()
@@ -2003,7 +2099,7 @@ class EditorApp:
 
     def _on_metadata_mode(self, *args) -> None:
         self.settings["metadata"] = self.metadata_var.get()
-        save_settings(self.settings)
+        save_settings({"metadata": self.settings["metadata"]})
 
     def _on_reopen(self, *args) -> None:
         if not self.windows:

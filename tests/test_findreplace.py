@@ -198,3 +198,94 @@ def test_every_line_in_a_batch_must_read_back(sample_doc, monkeypatch):
     monkeypatch.setattr(te, "write_text", misplace_second)
     with pytest.raises(te.EditError, match="couldn't be verified"):
         te.apply_edits(page, plans)
+
+
+# -- Review findings ------------------------------------------------------------------
+
+from erase import ErasePlan  # noqa: E402
+
+
+def test_search_sees_changes_made_inside_form_xobjects(tmp_path):
+    """MuPDF can move a page's text into a form XObject when it removes
+    text, leaving the page's own content identical for different edits."""
+    src = pymupdf.open()
+    page = src.new_page(width=400, height=300)
+    for y, text in ((100, "Alpha line one"), (130, "Beta line two"),
+                    (160, "Gamma line three")):
+        page.insert_text((50, y), text, fontname="helv", fontsize=12)
+    doc = pymupdf.open()
+    doc.new_page(width=400, height=300).show_pdf_page(pymupdf.Rect(0, 0, 400, 300), src, 0)
+    path = tmp_path / "forms.pdf"
+    doc.save(str(path))
+
+    model = editor.EditorModel()
+    model.open_document(str(path))
+
+    def erase(word):
+        w = next(w for w in model.words(0) if w.text == word)
+        model.erase(ErasePlan(page_num=0, words=[w]))
+    erase("Beta")
+    assert [m.run.text.strip() for m in model.find("line")][1] == "line two"
+    model.undo()
+    erase("Gamma")
+    found = sorted(m.run.text.strip() for m in model.find("line"))
+    assert found == ["Alpha line one", "Beta line two", "line three"]
+    assert model.find("Gamma") == []
+
+
+def test_text_drawn_twice_is_replaced_once_each(tmp_path):
+    doc = pymupdf.open()
+    page = doc.new_page(width=400, height=300)
+    page.insert_text((50, 100), "Total line here", fontname="helv", fontsize=12)
+    page.insert_text((50, 100), "Total line here", fontname="helv", fontsize=12)
+    page.insert_text((50, 140), "Other line text", fontname="helv", fontsize=12)
+    path = tmp_path / "dup.pdf"
+    doc.save(str(path))
+    model = editor.EditorModel()
+    model.open_document(str(path))
+    plan = model.plan_replace_all(model.find("line"), "row", "line")
+    assert [p.new_text for p in plan.plans].count("Total row here") == 2
+    assert plan.count == 3 and plan.skipped == []
+    model.apply_replace_all(plan)
+    assert model.get_page(0).get_text() == ("Total row here\nTotal row here\n"
+                                            "Other row text\n")
+
+
+def test_a_line_whose_removal_would_hit_other_text_is_skipped_not_fatal(tmp_path):
+    doc = pymupdf.open()
+    page = doc.new_page(width=400, height=300)
+    page.insert_text((50, 100), "Total line here", fontname="helv", fontsize=12)
+    page.insert_text((50, 99), "XXXXXXXXXXXXXXXX", fontname="helv", fontsize=12)  # overprinted
+    page.insert_text((50, 140), "Other line text", fontname="helv", fontsize=12)
+    path = tmp_path / "over.pdf"
+    doc.save(str(path))
+    model = editor.EditorModel()
+    model.open_document(str(path))
+    plan = model.plan_replace_all(model.find("line"), "row", "line")
+    assert [why for _m, why in plan.skipped] == [fr.OVERLAP_ERROR]
+    model.apply_replace_all(plan)                  # the rest still goes ahead
+    text = model.get_page(0).get_text()
+    assert "Other row text" in text and "Total line here" in text
+
+
+def test_batch_refuses_when_a_neighbour_line_changes_even_if_counts_balance(
+        sample_doc, monkeypatch):
+    """A wrongly removed character elsewhere can't hide behind one that
+    should have gone but didn't: lines not being replaced must be intact,
+    whatever the character counts say."""
+    from collections import Counter
+    page = sample_doc[0]
+    plans = [fr.plan_replace(sample_doc, m, "row") for m in fr.find_all(sample_doc, "line")
+             if m.run.text.strip() == TARGET]
+    # Character counts that always balance, so only the per-line check
+    # can notice anything.
+    monkeypatch.setattr(te, "_char_counts", lambda page: Counter())
+    monkeypatch.setattr(te, "_counted", lambda text: Counter())
+    real_apply = pymupdf.Page.apply_redactions
+
+    def also_damage_title(self, *a, **k):
+        self.add_redact_annot(pymupdf.Rect(40, 60, 70, 85), fill=False)  # "Qu" of the title
+        return real_apply(self, *a, **k)
+    monkeypatch.setattr(pymupdf.Page, "apply_redactions", also_damage_title)
+    with pytest.raises(te.EditError, match="nearby text"):
+        te.apply_edits(page, plans)

@@ -1224,3 +1224,27 @@ def test_opening_a_restricted_pdf_says_saving_keeps_the_restrictions(app, tmp_pa
     shutil.copy(FIXTURES / "encrypted_aes_256.pdf", path)
     assert app.open_path(str(path))
     assert "security restrictions, and saving keeps them" in app.status_label["text"]
+
+
+
+def _unsupported(tmp_path):
+    from conftest import FIXTURES
+    import shutil
+    path = tmp_path / "unsupported.pdf"
+    shutil.copy(FIXTURES / "unsupported_cleartext_metadata.pdf", path)
+    return path
+
+
+def test_unkeepable_restrictions_ask_before_saving_without_them(app, tmp_path, monkeypatch):
+    assert app.open_path(str(_unsupported(tmp_path)))
+    assert "can't keep" in app.status_label["text"]
+    out = tmp_path / "out.pdf"
+    asked = []
+    monkeypatch.setattr(editor.messagebox, "askyesno",
+                        lambda title, message, **k: asked.append(message) or False)
+    assert not app._save_to(str(out))
+    assert asked and "without its security restrictions" in asked[0]
+    assert not out.exists()
+    monkeypatch.setattr(editor.messagebox, "askyesno", lambda *a, **k: True)
+    assert app._save_to(str(out))
+    assert pymupdf.open(str(out)).metadata["encryption"] is None

@@ -59,6 +59,7 @@ separate runs, so editing one never flattens another's style.
 from __future__ import annotations
 
 import hashlib
+import io
 import math
 import re
 import string
@@ -67,6 +68,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import pymupdf
+from fontTools import agl
+from fontTools.ttLib import TTFont, newTable
+from fontTools.ttLib.tables._c_m_a_p import CmapSubtable
 
 import fontmatch
 from fontmatch import Face
@@ -673,8 +677,8 @@ def _embedded_fonts(doc: pymupdf.Document) -> List[Tuple[str, FontChoice]]:
 def _embedded_choice(doc: pymupdf.Document, xref: int, label: str,
                      kind: str) -> Optional[FontChoice]:
     try:
-        _name, ext, _ftype, content = doc.extract_font(xref)
-        if not content or ext in ("", "n/a"):
+        content = embedded_font_program(doc, xref)
+        if content is None:
             return None
         font = pymupdf.Font(fontbuffer=content)
     except Exception:
@@ -684,6 +688,202 @@ def _embedded_choice(doc: pymupdf.Document, xref: int, label: str,
     return FontChoice(font=font, label=label, original=kind == ORIGINAL,
                       key=hashlib.sha1(content).hexdigest(), check_ink=True,
                       kind=kind)
+
+
+def embedded_font_program(doc: pymupdf.Document, xref: int) -> Optional[bytes]:
+    """The font program embedded for font ``xref``, ready to write with.
+
+    PDFs from browsers and many other generators embed TrueType subsets
+    whose own character map is missing characters the page plainly shows
+    (dashes, bullets...): the PDF finds the glyphs by number and says what
+    they are in a separate /ToUnicode map. Such a font is given a
+    character map rebuilt from that, so it can draw everything the page
+    already uses."""
+    try:
+        _name, ext, _ftype, content = doc.extract_font(xref)
+    except Exception:
+        return None
+    if not content or ext in ("", "n/a"):
+        return None
+    if ext == "ttf":
+        content = _with_page_cmap(doc, xref, content) or content
+    return content
+
+
+_HEX = re.compile(r"<([0-9A-Fa-f]+)>")
+
+
+def _tounicode(doc: pymupdf.Document, xref: int) -> Dict[int, str]:
+    """A Type0 font's /ToUnicode map: character code -> one character."""
+    kind, value = doc.xref_get_key(xref, "ToUnicode")
+    if kind != "xref":
+        return {}
+    try:
+        cmap = doc.xref_stream(int(value.split()[0])).decode("latin-1")
+    except Exception:
+        return {}
+
+    def char(hexstr: str) -> Optional[str]:
+        try:
+            text = bytes.fromhex(hexstr).decode("utf-16-be")
+        except (ValueError, UnicodeDecodeError):
+            return None
+        # One printable character: not ligatures, and not U+0000, which
+        # some writers (Chrome) use for "unknown, see ActualText".
+        return text if len(text) == 1 and text >= " " else None
+
+    mapping: Dict[int, str] = {}
+    for block in re.findall(r"beginbfchar(.*?)endbfchar", cmap, re.S):
+        codes = _HEX.findall(block)
+        for code, target in zip(codes[0::2], codes[1::2]):
+            ch = char(target)
+            if ch:
+                mapping[int(code, 16)] = ch
+    for block in re.findall(r"beginbfrange(.*?)endbfrange", cmap, re.S):
+        for line in block.strip().splitlines():
+            parts = _HEX.findall(line)
+            if len(parts) < 3:
+                continue
+            low, high = int(parts[0], 16), int(parts[1], 16)
+            if "[" in line:                          # <lo> <hi> [<u1> <u2> ...]
+                for code, target in zip(range(low, high + 1), parts[2:]):
+                    ch = char(target)
+                    if ch:
+                        mapping[code] = ch
+            elif high - low < 0x10000:
+                start = int(parts[2], 16)
+                for offset in range(high - low + 1):
+                    point = start + offset
+                    if point <= 0x10FFFF and not 0xD800 <= point <= 0xDFFF:
+                        mapping[low + offset] = chr(point)
+    return mapping
+
+
+_CONTENT_TOKENS = re.compile(
+    rb"/([^\s/<>\[\]()]+)\s+[-\d.]+\s+Tf"                         # font
+    rb"|/ActualText\s*(?:<([0-9A-Fa-f\s]*)>|\(((?:\\.|[^\\)])*)\))"  # span text
+    rb"|\bEMC\b"                                                 # span end
+    rb"|<([0-9A-Fa-f]{4})>\s*Tj")                                 # one glyph
+
+
+def _actualtext_glyphs(doc: pymupdf.Document) -> Dict[int, Dict[int, str]]:
+    """Glyphs the page content says the character of with ActualText
+    (font xref -> {glyph code: character}). Chrome and Skia mark each glyph
+    they have no Unicode for that way, instead of in /ToUnicode. Worked
+    out once per document."""
+    cached = getattr(doc, "_pdfeditor_actualtext", None)
+    if cached is not None:
+        return cached
+    found: Dict[int, Dict[int, str]] = {}
+    for page in doc:
+        try:
+            names = {f[4]: f[0] for f in page.get_fonts(full=True)}
+            content = b"".join(doc.xref_stream(x) or b"" for x in page.get_contents())
+        except Exception:
+            continue
+        font, text, glyphs = None, None, []
+        for m in _CONTENT_TOKENS.finditer(content):
+            if m.group(1) is not None:
+                font = names.get(m.group(1).decode("latin-1"))
+            elif m.group(2) is not None or m.group(3) is not None:
+                text = _pdf_text_string(m.group(2), m.group(3))
+                glyphs = []
+            elif m.group(4) is not None:
+                if text is not None:
+                    glyphs.append((font, int(m.group(4), 16)))
+            else:                                       # EMC
+                if text is not None and len(text) == 1 and text >= " " \
+                        and len(glyphs) == 1 and glyphs[0][0] is not None:
+                    xref, code = glyphs[0]
+                    found.setdefault(xref, {})[code] = text
+                text, glyphs = None, []
+    try:
+        doc._pdfeditor_actualtext = found
+    except AttributeError:
+        pass
+    return found
+
+
+def _pdf_text_string(hex_part: Optional[bytes], literal: Optional[bytes]) -> Optional[str]:
+    """A PDF text string (UTF-16 with a byte-order mark, or PDFDocEncoding,
+    taken as Latin-1) from its hex or literal form."""
+    try:
+        if hex_part is not None:
+            raw = bytes.fromhex(hex_part.decode("ascii").replace(" ", "").replace("\n", ""))
+        else:
+            raw = re.sub(rb"\\([0-7]{1,3}|.)", lambda m: (
+                bytes([int(m.group(1), 8) & 0xFF]) if m.group(1)[:1].isdigit()
+                else {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"b": b"\b",
+                      b"f": b"\f"}.get(m.group(1), m.group(1))), literal)
+        if raw.startswith(b"\xfe\xff"):
+            return raw[2:].decode("utf-16-be")
+        return raw.decode("latin-1")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def _with_page_cmap(doc: pymupdf.Document, xref: int,
+                    content: bytes) -> Optional[bytes]:
+    """``content`` (a TrueType font program) with characters from the
+    font's /ToUnicode added to its character map, for an Identity-encoded
+    CIDFontType2 whose CIDs are glyph numbers. None if there's nothing to
+    add or it can't be done safely."""
+    if doc.xref_get_key(xref, "Encoding")[1] not in ("/Identity-H",):
+        return None
+    kind, value = doc.xref_get_key(xref, "DescendantFonts")
+    refs = re.findall(r"(\d+) 0 R", value) if kind in ("array", "xref") else []
+    if kind == "xref":
+        refs = re.findall(r"(\d+) 0 R", doc.xref_object(int(refs[0])))
+    if not refs:
+        return None
+    descendant = int(refs[0])
+    if doc.xref_get_key(descendant, "Subtype")[1] != "/CIDFontType2":
+        return None
+    if doc.xref_get_key(descendant, "CIDToGIDMap")[1] not in ("/Identity", "null"):
+        return None                         # a CID -> glyph table: not handled
+    by_code = _tounicode(doc, xref)
+    for code, ch in _actualtext_glyphs(doc).get(xref, {}).items():
+        by_code.setdefault(code, ch)
+    try:
+        font = TTFont(io.BytesIO(content))
+        order = font.getGlyphOrder()
+        existing = (font.getBestCmap() or {}) if "cmap" in font else {}
+        added = {}
+        # 1. What the PDF says each glyph it uses is.
+        for gid, ch in by_code.items():
+            if 0 < gid < len(order) and ord(ch) not in existing:
+                added.setdefault(ord(ch), order[gid])
+        # 2. Glyphs named for their character ("endash", "uni2013"), as
+        #    MuPDF itself reads them when /ToUnicode doesn't say. Subsets
+        #    often keep every glyph but only a few character map entries.
+        named = set(existing.values()) | set(added.values())
+        for name in order[1:]:
+            if name in named:
+                continue
+            text = agl.toUnicode(name)
+            if len(text) == 1 and ord(text) not in existing and ord(text) not in added:
+                added[ord(text)] = name
+        if not added:
+            return None
+        if "cmap" not in font:
+            font["cmap"] = newTable("cmap")
+            font["cmap"].tableVersion = 0
+            font["cmap"].tables = []
+        mapping = dict(existing)
+        mapping.update(added)
+        tables = []
+        for platform, encoding, fmt in ((3, 1, 4), (3, 10, 12)):
+            table = CmapSubtable.newSubtable(fmt)
+            table.platformID, table.platEncID, table.language = platform, encoding, 0
+            table.cmap = ({k: v for k, v in mapping.items() if k <= 0xFFFF}
+                          if fmt == 4 else dict(mapping))
+            tables.append(table)
+        font["cmap"].tables = tables
+        out = io.BytesIO()
+        font.save(out)
+        return out.getvalue()
+    except Exception:
+        return None
 
 
 def _pdf_widths(doc: pymupdf.Document, page: pymupdf.Page,
@@ -731,7 +931,7 @@ def similar_face(doc: pymupdf.Document, page: pymupdf.Page, run: TextRun,
         ref = fontmatch.Reference(
             font=reference_font, chars=chars or run.text,
             widths=widths,
-            bold=run.bold, italic=run.italic, mono=run.monospaced,
+            bold=run.bold, italic=run.italic, mono=run.monospaced, name=run.font,
             # Flags often leave "serif" unset, so a no means "don't know",
             # unless the name says sans.
             serif=(True if run.serif
@@ -751,12 +951,14 @@ def resolve_original_font(doc: pymupdf.Document, page: pymupdf.Page,
     """
     seen = set()
     found_embedded = False
+    best, best_count = None, 0
+    wanted = [c for c in dict.fromkeys(run.primary_text) if not c.isspace()]
     for xref, _ext, _type, basefont, *_ in page.get_fonts(full=True):
         if xref in seen:
             continue
         seen.add(xref)
-        _name, ext, _ftype, content = doc.extract_font(xref)
-        if not content or ext in ("", "n/a"):
+        content = embedded_font_program(doc, xref)
+        if content is None:
             continue
         try:
             font = pymupdf.Font(fontbuffer=content)
@@ -775,10 +977,17 @@ def resolve_original_font(doc: pymupdf.Document, page: pymupdf.Page,
         choice = FontChoice(font=font, label=run.font, original=True,
                             key=hashlib.sha1(content).hexdigest(),
                             check_ink=True, kind=ORIGINAL)
-        if all(choice.has_char(c) for c in run.primary_text
-               if not c.isspace()):
+        count = sum(1 for c in wanted if choice.has_char(c))
+        if count == len(wanted):
             return choice, ""
+        # Keep the candidate that draws the most of the run's characters:
+        # a font missing one or two (often punctuation) is still the run's
+        # font for everything else, and only the rest needs another font.
+        if count > best_count:
+            best, best_count = choice, count
 
+    if best is not None:
+        return best, ""
     if not found_embedded:
         code = STANDARD_14.get(normalize_font_name(run.font))
         if code:

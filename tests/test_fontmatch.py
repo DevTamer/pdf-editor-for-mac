@@ -613,3 +613,18 @@ def test_characters_sharing_a_glyph_are_written_apart(installed_fonts):
     # ...and in Arial: PyMuPDF quietly draws a character missing from a
     # subset with a fallback font, which would still read back.
     assert all("Arial" in name for name in _span_fonts(doc[0]))
+
+
+
+def test_rounded_fonts_only_stand_in_for_rounded_text(installed_fonts):
+    installed_fonts("Supplemental/Arial Rounded Bold.ttf", HELVETICA)
+    # (Arial Rounded Bold calls itself weight 400, so compare as regular.)
+    arial = pymupdf.Font(fontfile=str(SUPPLEMENTAL / "Arial.ttf"))
+    plain = fontmatch.Reference(font=arial, chars="Invoice total", name="Inter-Regular")
+    rounded = fontmatch.Reference(font=arial, chars="Invoice total",
+                                  name="ArialRoundedMTBold")
+    index = fontmatch.default_index()
+    assert all("Rounded" not in f.family
+               for _d, f in fontmatch.closest_faces(plain, index, limit=10))
+    assert any("Rounded" in f.family
+               for _d, f in fontmatch.closest_faces(rounded, index, limit=10))

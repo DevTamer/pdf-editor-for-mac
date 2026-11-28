@@ -74,8 +74,13 @@ onto an extra layer or annotation.
 **Security restrictions are kept.** A PDF that opens without a password
 but has restrictions set by its owner (no copying, no changes, printing
 only...) saves with the same encryption, the same restrictions and the
-same owner password, so whoever set them can still lift them. (PDFs that
-need a password just to open aren't supported yet.)
+same owner password, so whoever set them can still lift them. Every such
+save is read back and compared with what you edited before it replaces
+anything. A few encryption setups can't be written back faithfully
+(metadata left unencrypted, different ciphers for text and content,
+per-stream encryption); for those you're asked whether to save without
+the restrictions, and nothing is saved unless you say so. (PDFs that need
+a password just to open aren't supported yet.)
 
 **File → Metadata on Save** decides what happens to the document's
 metadata (title, author, dates, the app that made it). It's one setting
@@ -121,7 +126,12 @@ PDFs usually embed only a *subset* of each font: just the characters the
 document already uses. When you type a character the PDF's copy of the
 font doesn't have, the app looks for it, in this order:
 
-1. **The PDF's own font.**
+1. **The PDF's own font.** PDFs from browsers often embed fonts whose
+   built-in character map is missing characters the page shows (dashes,
+   bullets): the PDF identifies those through its /ToUnicode map, glyph
+   names or ActualText instead. The editor rebuilds the font's character
+   map from those, so it can draw everything the page already uses. And a
+   font that can't draw one character is still used for all the others.
 2. **The same font elsewhere in the PDF.** Some PDFs embed a separate
    subset of a font on each page.
 3. **The same font, installed on your Mac.** "ArialMT" finds Arial,
@@ -268,6 +278,8 @@ The suite has these parts:
   words, ligatures), Replace, and Replace All as one verified,
   all-or-nothing step.
 - `test_metadata.py` covers what saving does with metadata.
+- `test_apple_rendering.py` checks edited PDFs in Apple's renderer
+  (Preview), not only MuPDF (macOS only; uses `sips`).
 - `test_encryption.py` covers keeping encryption and restrictions, in
   each standard encryption scheme
   (`tests/fixtures/make_encrypted_samples.sh` makes the samples with
@@ -337,6 +349,15 @@ the test suite there, then builds `packaging/dist/PDF Editor.app` and
   - `EditorApp` is the window, the tools, menus and sidebar.
 
 PyMuPDF quirks the code works around, each with a regression test:
+
+- **Pages could go blank in Preview.** PyMuPDF 1.24 rewrote page content,
+  when removing text, in an order MuPDF accepts but Apple's renderer
+  (Preview, Safari, Quick Look) doesn't, hiding much of the page. Fixed by
+  requiring PyMuPDF 1.25 or later; `test_apple_rendering.py` renders with
+  Apple's own engine to keep it that way.
+- **Re-encrypting is limited.** MuPDF writes one cipher for everything, so
+  only the encryption setups it handles are kept, and every encrypted
+  save is verified.
 
 - **Saving can blank the open document.** In PyMuPDF 1.24, a
   garbage-collecting save of a document with newly written text can blank

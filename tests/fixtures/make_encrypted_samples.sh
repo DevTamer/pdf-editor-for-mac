@@ -20,6 +20,11 @@ for i in range(2):
     page.insert_image(pymupdf.Rect(250, 150, 330, 230), pixmap=pix)
 doc.set_metadata({"title": "Encrypted sample", "author": "Test",
                   "modDate": "D:20240102120000Z"})
+doc.set_xml_metadata('<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+                     'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+                     '<rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/">'
+                     '<dc:format>application/pdf</dc:format></rdf:Description>'
+                     '</rdf:RDF></x:xmpmeta>')
 doc.save("encrypted_plain.tmp.pdf")
 PYEOF
 for spec in "rc4_40:40" "rc4_128:128 --use-aes=n" "aes_128:128 --use-aes=y" "aes_256:256"; do
@@ -31,4 +36,9 @@ for spec in "rc4_40:40" "rc4_128:128 --use-aes=n" "aes_128:128 --use-aes=y" "aes
         --encrypt "" owner "$bits" $perms $rest -- \
         encrypted_plain.tmp.pdf "encrypted_${name}.pdf"
 done
+# Metadata left unencrypted (Acrobat's "encrypt all contents except
+# metadata"): MuPDF can't write that back, so the editor refuses to keep it.
+qpdf --object-streams=generate --encrypt "" owner 128 --use-aes=y \
+    --cleartext-metadata --print=full --modify=none --extract=n -- \
+    encrypted_plain.tmp.pdf "unsupported_cleartext_metadata.pdf"
 rm encrypted_plain.tmp.pdf

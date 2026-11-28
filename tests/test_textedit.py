@@ -45,7 +45,7 @@ def test_page_runs_finds_every_line_with_style(sample_doc):
     assert title.size == pytest.approx(20)
     assert title.color == pytest.approx(BLUE, abs=0.01)
     assert title.origin == pytest.approx((50, 80))
-    assert title.font == "NimbusRoman-Regular"
+    assert te.same_font_name(title.font, "NimbusRoman-Regular")
     assert runs[TARGET].font == "Helvetica"
     assert runs[TARGET].origin == pytest.approx((50, 162))
     assert all(r.is_horizontal for r in runs.values())
@@ -318,7 +318,7 @@ def test_edit_keeps_position_size_colour_and_font(sample_doc):
     assert new.origin == pytest.approx(title.origin, abs=0.01)
     assert new.size == pytest.approx(title.size)
     assert new.color == pytest.approx(title.color, abs=0.01)
-    assert new.font == title.font
+    assert te.same_font_name(new.font, title.font)
 
 
 def test_edit_leaves_graphics_and_images_alone(sample_doc):
@@ -684,3 +684,150 @@ def test_add_text_on_cropped_pages(crop):
 def test_add_text_rejects_nonsense_sizes(sample_doc, size):
     plan = te.plan_add_text(sample_doc[0], 0, (60, 300), "x", te.TextStyle(size=size))
     assert not plan.can_apply and "between" in plan.errors[0]
+
+
+# -- Fonts whose own character map is incomplete ----------------------------------------
+# Browser-made PDFs (Chrome, Skia) embed TrueType fonts whose character map
+# lacks characters the page shows: the PDF knows them from /ToUnicode, or
+# only from ActualText around the glyph.
+
+import io  # noqa: E402
+import re  # noqa: E402
+
+from fontTools.ttLib import TTFont  # noqa: E402
+
+from conftest import SUPPLEMENTAL  # noqa: E402
+
+LINE = "Total due - 2026"
+
+
+def _browser_style_font_pdf(path, strip="", unknown_in_tounicode="", actual_text="",
+                            glyph_names=False):
+    """``LINE`` in an Arial subset embedded as an Identity-H CID TrueType
+    font, each glyph shown by number. ``strip``: characters removed from
+    the embedded font's own character map; ``unknown_in_tounicode``:
+    characters /ToUnicode maps to U+0000 (as Chrome does); ``actual_text``:
+    characters marked with ActualText around their glyph instead."""
+    from fontTools.subset import Options, Subsetter
+    font = TTFont(str(SUPPLEMENTAL / "Arial.ttf"))
+    options = Options()
+    options.name_IDs = ["*"]
+    options.name_legacy = True
+    options.glyph_names = glyph_names        # keep "hyphen", "x"... in 'post'
+    subsetter = Subsetter(options=options)
+    subsetter.populate(unicodes={ord(c) for c in LINE + "x"})
+    subsetter.subset(font)
+    buf = io.BytesIO()
+    font.save(buf)
+    full = buf.getvalue()
+    pfont = pymupdf.Font(fontbuffer=full)
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=400, height=200)
+    writer = pymupdf.TextWriter(page.rect)
+    writer.append((50, 100), LINE, font=pfont, fontsize=14)
+    writer.write_text(page)
+    xref, _ext, _type, _base, name, *_ = page.get_fonts(full=True)[0]
+
+    # Show each glyph by number, some inside ActualText spans.
+    parts = [f"BT /{name} 14 Tf 1 0 0 1 50 100 Tm"]
+    for ch in LINE:
+        glyph = f"<{pfont.has_glyph(ord(ch)):04X}> Tj"
+        if ch in actual_text:
+            hexed = ch.encode("utf-16-be").hex().upper()
+            glyph = f"/Span<</ActualText <FEFF{hexed}>>> BDC {glyph} EMC"
+        parts.append(glyph)
+    parts.append("ET")
+    doc.update_stream(page.get_contents()[0], "\n".join(parts).encode())
+
+    if unknown_in_tounicode:
+        tounicode = int(doc.xref_get_key(xref, "ToUnicode")[1].split()[0])
+        cmap = doc.xref_stream(tounicode).decode("latin-1")
+        for ch in unknown_in_tounicode:
+            cmap = re.sub(rf"(<{pfont.has_glyph(ord(ch)):04X}>\s*)<{ord(ch):04X}>",
+                          r"\1<0000>", cmap, flags=re.I)
+        doc.update_stream(tounicode, cmap.encode("latin-1"))
+    if strip:
+        stripped = TTFont(io.BytesIO(full))
+        for table in stripped["cmap"].tables:
+            for ch in strip:
+                table.cmap.pop(ord(ch), None)
+        buf = io.BytesIO()
+        stripped.save(buf)
+        descendant = int(re.search(r"(\d+) 0 R",
+                                   doc.xref_get_key(xref, "DescendantFonts")[1]).group(1))
+        descriptor = int(doc.xref_get_key(descendant, "FontDescriptor")[1].split()[0])
+        file_kind, file_ref = next(
+            (key, doc.xref_get_key(descriptor, key)[1]) for key in ("FontFile2", "FontFile3")
+            if doc.xref_get_key(descriptor, key)[0] == "xref")
+        doc.update_stream(int(file_ref.split()[0]), buf.getvalue())
+    doc.save(str(path))
+    return pymupdf.open(str(path))
+
+
+def _line_run(doc):
+    return next(r for r in te.page_runs(doc[0], 0) if "Total" in r.text)
+
+
+def test_the_fixture_is_a_cid_truetype_font(tmp_path):
+    doc = _browser_style_font_pdf(tmp_path / "f.pdf")
+    xref = doc[0].get_fonts(full=True)[0][0]
+    descendant = int(re.search(r"(\d+) 0 R", doc.xref_get_key(xref, "DescendantFonts")[1]).group(1))
+    assert doc.xref_get_key(descendant, "Subtype")[1] == "/CIDFontType2"
+    assert _line_run(doc).text == LINE
+
+
+def test_characters_only_tounicode_knows_are_drawn_with_the_pdfs_own_font(tmp_path):
+    doc = _browser_style_font_pdf(tmp_path / "f.pdf", strip="-2")
+    run = _line_run(doc)
+    assert run.text == LINE                                    # the page reads fine
+    original, reason = te.resolve_original_font(doc, doc[0], run)
+    assert reason == "" and original.can_draw("-") and original.can_draw("2")
+    plan = te.plan_edit(doc, doc[0], run, "Total due - 2022")
+    assert {s.choice.kind for s in plan.segments} == {te.ORIGINAL}
+    assert plan.warnings == []
+    te.apply_edit(doc[0], plan)
+    assert "Total due - 2022" in doc[0].get_text()
+
+
+def test_characters_known_only_from_actualtext_are_drawn_with_the_pdfs_own_font(tmp_path):
+    doc = _browser_style_font_pdf(tmp_path / "f.pdf", strip="-",
+                                  unknown_in_tounicode="-", actual_text="-")
+    run = _line_run(doc)
+    assert run.text == LINE                       # MuPDF reads the ActualText
+    original, _reason = te.resolve_original_font(doc, doc[0], run)
+    assert original.can_draw("-")
+    plan = te.plan_edit(doc, doc[0], run, "Total due - 2022")
+    assert {s.choice.kind for s in plan.segments} == {te.ORIGINAL}
+
+
+def test_a_font_missing_a_character_is_still_used_for_the_rest(tmp_path, monkeypatch):
+    """If a character really can't be recovered, only that character uses
+    another font; the line isn't rewritten in a lookalike."""
+    doc = _browser_style_font_pdf(tmp_path / "f.pdf", strip="-")
+    monkeypatch.setattr(te, "_with_page_cmap", lambda *a: None)   # no rebuild
+    run = _line_run(doc)
+    original, reason = te.resolve_original_font(doc, doc[0], run)
+    assert reason == "" and original is not None and not original.can_draw("-")
+    plan = te.plan_edit(doc, doc[0], run, "Total due - 2022")
+    by_kind = {}
+    for segment in plan.segments:
+        by_kind.setdefault(segment.choice.kind, "")
+        by_kind[segment.choice.kind] += segment.text
+    assert by_kind[te.ORIGINAL].replace(" ", "") == "Totaldue2022"
+    assert "-" not in by_kind[te.ORIGINAL]
+
+
+def test_glyphs_named_for_their_character_can_be_used(tmp_path):
+    """"x" is in the embedded font but in no character map and nowhere on
+    the page: only its glyph name says what it is."""
+    doc = _browser_style_font_pdf(tmp_path / "f.pdf", strip="x", unknown_in_tounicode="x",
+                                  glyph_names=True)
+    original, _reason = te.resolve_original_font(doc, doc[0], _line_run(doc))
+    assert original.can_draw("x")
+
+
+def test_without_glyph_names_an_unmapped_glyph_isnt_guessed(tmp_path):
+    doc = _browser_style_font_pdf(tmp_path / "f.pdf", strip="x", unknown_in_tounicode="x")
+    original, _reason = te.resolve_original_font(doc, doc[0], _line_run(doc))
+    assert not original.can_draw("x")

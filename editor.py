@@ -204,6 +204,62 @@ def remove_document_info(doc: pymupdf.Document) -> None:
             continue          # a free or damaged object
 
 
+class RestrictionsError(Exception):
+    """Saving can't keep this PDF's encryption and restrictions. The
+    caller may ask whether to save without them."""
+
+
+def keep_encryption_problem(doc: pymupdf.Document) -> Optional[str]:
+    """Why this encrypted PDF's encryption can't be written back
+    faithfully, or None if it can.
+
+    MuPDF re-encrypts everything with one cipher: it ignores a stream
+    cipher that differs from the string cipher, unencrypted metadata
+    (/EncryptMetadata false) and per-stream /Crypt filters, and writes
+    files that can't be read back. Only setups it handles are kept."""
+    def key(name):
+        return doc.xref_get_key(-1, f"Encrypt/{name}")[1]
+    unsupported = ("This PDF uses a kind of encryption the editor can't "
+                   "reproduce, so its security restrictions can't be kept.")
+    if key("Filter") != "/Standard":
+        return unsupported
+    version = key("V")
+    if version in ("4", "5"):
+        stream_cf, string_cf, file_cf = key("StmF"), key("StrF"), key("EFF")
+        if (stream_cf != string_cf or stream_cf in ("/Identity", "null")
+                or file_cf not in ("null", stream_cf)):
+            return unsupported
+    elif version not in ("1", "2"):
+        return unsupported
+    if key("EncryptMetadata") == "false":
+        return ("This PDF keeps its metadata unencrypted, which the editor "
+                "can't reproduce, so its security restrictions can't be kept.")
+    for xref in range(1, doc.xref_length()):
+        try:
+            if "/Crypt" in doc.xref_get_key(xref, "Filter")[1]:
+                return unsupported
+        except Exception:
+            continue
+    return None
+
+
+def _same_file(doc: pymupdf.Document, original: pymupdf.Document) -> bool:
+    """Whether ``original`` (opened from the bytes read) is the file ``doc``
+    was opened from: it can be replaced on disk in between. (Not by
+    comparing trailers: taking a snapshot of ``doc`` drops /Encrypt from
+    its trailer in memory.)"""
+    def file_id(d):
+        # The first /ID entry is the file's permanent identifier (taking a
+        # snapshot rewrites the second one in memory too).
+        kind, value = d.xref_get_key(-1, "ID")
+        ids = re.findall(r"<([0-9A-Fa-f]*)>", value) if kind == "array" else []
+        return ids[0].upper() if ids else None
+    return (original.xref_length() == doc.xref_length()
+            and original.page_count == doc.page_count
+            and file_id(original) == file_id(doc)
+            and original.metadata.get("encryption") == doc.metadata.get("encryption"))
+
+
 def keep_encryption(edited: pymupdf.Document,
                     original_bytes: bytes) -> pymupdf.Document:
     """The original encrypted file with ``edited``'s content in it, ready
@@ -222,6 +278,14 @@ def keep_encryption(edited: pymupdf.Document,
     target_pdf = pymupdf._as_pdf_document(target)
     kind, value = target.xref_get_key(-1, "Encrypt")
     encrypt_xref = int(value.split()[0]) if kind == "xref" else None
+    if encrypt_xref is not None and encrypt_xref < edited.xref_length():
+        # That number is the encryption dictionary's: in the edited copy it
+        # must be that same dictionary (or nothing), never content that
+        # skipping it would lose.
+        theirs = edited.xref_object(encrypt_xref, compressed=True).strip()
+        if theirs not in ("", "null") and theirs != target.xref_object(
+                encrypt_xref, compressed=True).strip():
+            raise ValueError("the edited document doesn't match the original file")
     while target.xref_length() < edited.xref_length():
         target.get_new_xref()
     for xref in range(1, edited.xref_length()):
@@ -239,7 +303,19 @@ def keep_encryption(edited: pymupdf.Document,
     for key in ("Root", "Info"):
         kind, value = edited.xref_get_key(-1, key)
         target.xref_set_key(-1, key, value if kind != "null" else "null")
+    # (Saving gives the file a new second /ID entry, as the PDF spec asks
+    # of a changed file; the first, which the key is made from, stays.)
     return target
+
+
+def _same_content(saved: pymupdf.Document, edited: pymupdf.Document) -> bool:
+    """Whether a saved file reads exactly like the document it was saved
+    from: page text and the XMP metadata."""
+    if saved.needs_pass or saved.page_count != edited.page_count:
+        return False
+    if any(saved[i].get_text() != edited[i].get_text() for i in range(edited.page_count)):
+        return False
+    return saved.get_xml_metadata() == edited.get_xml_metadata()
 
 
 def load_settings() -> dict:
@@ -303,10 +379,15 @@ class EditorModel(DocumentSession):
         self.save_path: Optional[str] = None
         self._search_cache: dict = {}
         self._encrypted_original: Optional[bytes] = None
+        # Why an encrypted PDF's restrictions can't be kept, if they can't.
+        self.restriction_problem: Optional[str] = None
 
     # -- Document lifecycle ---------------------------------------------------
 
     def open_document(self, path: str) -> None:
+        # Read the file first: if that fails, nothing has changed yet.
+        with open(path, "rb") as fh:
+            data = fh.read()
         # If this fails (unreadable or password-protected file), pdfcore
         # leaves the current document, its history and our state untouched.
         super().open_document(path)
@@ -314,11 +395,26 @@ class EditorModel(DocumentSession):
         # An encrypted PDF that opened without a password (an owner
         # password protecting its permissions): keep the original file, so
         # saving can keep its encryption and restrictions (keep_encryption).
+        self._encrypted_original = None
+        self.restriction_problem: Optional[str] = None
         if self.doc.metadata.get("encryption"):
-            with open(path, "rb") as fh:
-                self._encrypted_original = fh.read()
-        else:
-            self._encrypted_original = None
+            # Judged on a fresh copy of the file: the open document's own
+            # trailer has lost /Encrypt to the first undo snapshot.
+            try:
+                original = pymupdf.open(stream=data, filetype="pdf")
+            except Exception:
+                original = None
+            if original is None or not _same_file(self.doc, original):
+                problem = ("The file changed while it was being opened, so its "
+                           "security restrictions can't be kept.")
+            else:
+                problem = keep_encryption_problem(original)
+            if original is not None:
+                original.close()
+            if problem is None:
+                self._encrypted_original = data
+            else:
+                self.restriction_problem = problem
         # Every undo step holds a full copy of the document: cap the count so
         # a big scan doesn't eat gigabytes of memory.
         size = max(1, len(self.history.current.doc_bytes))
@@ -335,6 +431,7 @@ class EditorModel(DocumentSession):
         super().close_document()
         self._search_cache = {}
         self._encrypted_original = None
+        self.restriction_problem = None
         self._saved_entry = None
         self.save_path = None
 
@@ -533,14 +630,20 @@ class EditorModel(DocumentSession):
 
     # -- Saving ---------------------------------------------------------------
 
-    def save_document(self, path: str,
-                      metadata: str = METADATA_UPDATE_DATE) -> None:
+    def save_document(self, path: str, metadata: str = METADATA_UPDATE_DATE,
+                      drop_restrictions: bool = False) -> None:
         """Write the current state to ``path``.
 
         ``metadata`` says what happens to the document's metadata: keep
         it with today's modification date (the default), keep it exactly,
         or remove it (see METADATA_MODES). The open document isn't
         changed either way.
+
+        An encrypted PDF is saved with its encryption, restrictions and
+        owner password (keep_encryption), and the written file is checked
+        against the edited document before it replaces anything. If they
+        can't be kept, RestrictionsError is raised and nothing is written,
+        unless ``drop_restrictions`` says to save without them.
 
         Saves from a copy, never from the live document: in PyMuPDF
         1.24, a garbage-collecting save of a document with newly written
@@ -551,15 +654,24 @@ class EditorModel(DocumentSession):
         """
         if metadata not in METADATA_MODES:
             raise ValueError(metadata)
+        if self.restriction_problem and not drop_restrictions:
+            raise RestrictionsError(self.restriction_problem)
         copy = pymupdf.open(stream=self.doc.tobytes(), filetype="pdf")
         if metadata == METADATA_UPDATE_DATE:
             update_modification_date(copy)
         elif metadata == METADATA_REMOVE:
             remove_document_info(copy)
+        edited = None
         encryption = pymupdf.PDF_ENCRYPT_NONE
-        if self._encrypted_original is not None:
-            edited, copy = copy, keep_encryption(copy, self._encrypted_original)
-            edited.close()
+        if self._encrypted_original is not None and not drop_restrictions:
+            edited = copy
+            try:
+                copy = keep_encryption(edited, self._encrypted_original)
+            except Exception as exc:
+                edited.close()
+                raise RestrictionsError(
+                    "The security restrictions couldn't be written back "
+                    f"({exc}).") from exc
             encryption = pymupdf.PDF_ENCRYPT_KEEP
         directory = os.path.dirname(os.path.abspath(path))
         # Keep an existing file's permissions; give a new file the usual
@@ -572,6 +684,18 @@ class EditorModel(DocumentSession):
         os.close(fd)
         try:
             copy.save(tmp_path, garbage=3, deflate=True, encryption=encryption)
+            if edited is not None:
+                # Check the encrypted file reads exactly like what was
+                # edited before it replaces anything.
+                written = pymupdf.open(tmp_path)
+                try:
+                    faithful = _same_content(written, edited)
+                finally:
+                    written.close()
+                if not faithful:
+                    raise RestrictionsError(
+                        "The file couldn't be saved correctly with its "
+                        "security restrictions.")
             os.chmod(tmp_path, mode)
             os.replace(tmp_path, path)
         except Exception:
@@ -580,6 +704,8 @@ class EditorModel(DocumentSession):
             raise
         finally:
             copy.close()
+            if edited is not None:
+                edited.close()
         self._saved_entry = self.history.current
         self.save_path = path
 
@@ -1827,6 +1953,10 @@ class EditorWindow:
         if self.model.keeps_restrictions:
             self._set_status(f"Opened {os.path.basename(path)} — it has "
                              "security restrictions, and saving keeps them")
+        elif self.model.restriction_problem:
+            self._set_status(f"Opened {os.path.basename(path)} — it has "
+                             "security restrictions that saving can't keep "
+                             "(you'll be asked)")
         else:
             self._set_status(f"Opened {os.path.basename(path)} — click any "
                              "text to edit it")
@@ -1881,7 +2011,17 @@ class EditorWindow:
             return False
         mode = self.app.metadata_var.get()
         try:
-            self.model.save_document(path, metadata=mode)
+            try:
+                self.model.save_document(path, metadata=mode)
+            except RestrictionsError as exc:
+                if not messagebox.askyesno(
+                        "Security Restrictions",
+                        f"{exc}\n\nSave it without its security restrictions? "
+                        "Anyone could then copy, change or print it.",
+                        icon="warning", default="no", parent=self.window):
+                    self._set_status("Not saved")
+                    return False
+                self.model.save_document(path, metadata=mode, drop_restrictions=True)
         except Exception as exc:
             self._show_error("Error", f"Could not save PDF:\n{exc}")
             return False

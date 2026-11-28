@@ -480,6 +480,7 @@ class Reference:
     italic: bool = False
     mono: bool = False
     serif: Optional[bool] = None
+    name: str = ""                      # the PDF's name for the font
 
 
 def ink_height(font: pymupdf.Font, ch: str) -> float:
@@ -571,9 +572,12 @@ def _kind_matches(face: Face, ref: Reference) -> bool:
         return False
     name = f"{face.family} {face.style}".lower()
     # Decorative fonts score well on a few letters and look nothing alike.
-    return not any(word in name for word in (
-        "symbol", "dings", "emoji", "braille", "ornament", "lastresort",
-        "hand", "script", "stencil", "shadow", "outline", "inline"))
+    if any(word in name for word in (
+            "symbol", "dings", "emoji", "braille", "ornament", "lastresort",
+            "hand", "script", "stencil", "shadow", "outline", "inline")):
+        return False
+    # Rounded variants (SF Pro Rounded, Arial Rounded) only for rounded text.
+    return "rounded" not in name or "rounded" in ref.name.lower()
 
 
 def closest_faces(ref: Reference, index: FontIndex,

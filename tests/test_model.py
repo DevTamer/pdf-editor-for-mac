@@ -236,7 +236,11 @@ def test_dirty_tracking_follows_the_saved_state(model, tmp_path):
 
 
 def test_describe_font(model):
-    assert model.describe_font(_run(model, TITLE)) == "NimbusRoman-Regular (embedded)"
+    # (PyMuPDF reports the embedded font as "NimbusRoman-Regular" or
+    # "Nimbus Roman Regular", depending on version.)
+    described = model.describe_font(_run(model, TITLE))
+    assert described.endswith(" (embedded)")
+    assert te.same_font_name(described[:-len(" (embedded)")], "NimbusRoman-Regular")
     assert model.describe_font(_run(model, TARGET)) == "Helvetica (standard PDF font)"
 
 

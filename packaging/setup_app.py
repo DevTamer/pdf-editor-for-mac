@@ -96,14 +96,14 @@ DATA_FILES += bundle_dir_as_data_files(
 OPTIONS = {
     "argv_emulation": False,
     "iconfile": "icon.icns",
-    "packages": ["pymupdf", "PIL", "pdfcore"],
-    "includes": ["textedit"],
+    "packages": ["pymupdf", "PIL", "pdfcore", "fontTools"],
+    "includes": ["textedit", "erase", "fontmatch", "findreplace"],
     "plist": {
         "CFBundleName": "PDF Editor",
         "CFBundleDisplayName": "PDF Editor",
         "CFBundleIdentifier": "com.devtamer.pdfeditor",
-        "CFBundleVersion": "0.1.0",
-        "CFBundleShortVersionString": "0.1.0",
+        "CFBundleVersion": "0.2.0",
+        "CFBundleShortVersionString": "0.2.0",
         "NSHumanReadableCopyright": "PDF Editor",
         "LSMinimumSystemVersion": "11.0",
         "NSHighResolutionCapable": True,

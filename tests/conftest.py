@@ -67,6 +67,52 @@ def build_sample_pdf(path: Path) -> None:
     doc.close()
 
 
+SYSTEM_FONTS = Path("/System/Library/Fonts")
+SUPPLEMENTAL = SYSTEM_FONTS / "Supplemental"
+
+
+def _use_fonts(directory: Path):
+    import fontmatch
+    import textedit
+    fontmatch.set_default_index(fontmatch.FontIndex(dirs=(str(directory),),
+                                                    cache_path=None))
+    textedit._SIMILAR_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
+def private_settings(tmp_path, monkeypatch):
+    """Tests never read or write the real settings file."""
+    import editor
+    monkeypatch.setattr(editor, "SETTINGS_PATH", str(tmp_path / "settings.json"))
+
+
+@pytest.fixture(autouse=True)
+def no_installed_fonts(tmp_path_factory):
+    """By default tests see no installed fonts, so results don't depend on
+    what's installed on the machine running them (new characters fall back
+    to the standard fonts). Tests about installed fonts use
+    ``installed_fonts``."""
+    _use_fonts(tmp_path_factory.mktemp("no-fonts"))
+    yield
+    _use_fonts(tmp_path_factory.mktemp("no-fonts"))
+
+
+@pytest.fixture
+def installed_fonts(tmp_path_factory):
+    """Make exactly these macOS font files "installed": call it with their
+    paths (relative to /System/Library/Fonts). Skips if one is missing."""
+    def install(*names):
+        directory = tmp_path_factory.mktemp("fonts")
+        for name in names:
+            source = SYSTEM_FONTS / name
+            if not source.exists():
+                pytest.skip(f"{source} isn't installed")
+            (directory / source.name).symlink_to(source)
+        _use_fonts(directory)
+        return directory
+    return install
+
+
 @pytest.fixture(autouse=True)
 def small_glyph_heights():
     """Match the app, which turns tight text boxes on at startup."""

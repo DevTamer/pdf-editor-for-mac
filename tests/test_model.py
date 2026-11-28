@@ -236,7 +236,11 @@ def test_dirty_tracking_follows_the_saved_state(model, tmp_path):
 
 
 def test_describe_font(model):
-    assert model.describe_font(_run(model, TITLE)) == "NimbusRoman-Regular (embedded)"
+    # (PyMuPDF reports the embedded font as "NimbusRoman-Regular" or
+    # "Nimbus Roman Regular", depending on version.)
+    described = model.describe_font(_run(model, TITLE))
+    assert described.endswith(" (embedded)")
+    assert te.same_font_name(described[:-len(" (embedded)")], "NimbusRoman-Regular")
     assert model.describe_font(_run(model, TARGET)) == "Helvetica (standard PDF font)"
 
 
@@ -285,3 +289,93 @@ def test_overwriting_keeps_the_file_permissions(model, tmp_path):
     os.chmod(out, 0o640)
     model.save_document(str(out))
     assert stat.S_IMODE(out.stat().st_mode) == 0o640
+
+
+# -- Adding text and erasing -----------------------------------------------------
+
+from erase import ErasePlan, FILL_COLOR  # noqa: E402
+from textedit import TextStyle  # noqa: E402
+
+
+def test_add_text_is_one_undo_step(model):
+    label = model.add_text(0, (60, 300), "Added note", TextStyle(size=14))
+    assert label == "Add “Added note”"
+    assert "Added note" in _page_text(model)
+    assert model.history_entries()[-1] == label and model.is_dirty
+    model.undo()
+    assert "Added note" not in _page_text(model)
+
+
+def test_add_text_errors_change_nothing(model):
+    with pytest.raises(te.EditError, match="can't draw"):
+        model.add_text(0, (60, 300), "漢字", TextStyle())
+    assert model.history_entries() == ["Original"]
+
+
+def test_add_text_rolls_back_on_failure(model, monkeypatch):
+    monkeypatch.setattr("editor.apply_add_text",
+                        lambda page, plan: (page.insert_text((10, 10), "junk"),
+                                            (_ for _ in ()).throw(te.EditError("nope"))))
+    before = _page_text(model)
+    with pytest.raises(te.EditError, match="nope"):
+        model.add_text(0, (60, 300), "x", TextStyle())
+    assert _page_text(model) == before
+    assert model.history_entries() == ["Original"]
+
+
+def test_erase_words_is_one_undo_step(model):
+    words = [w for w in model.words(0) if w.text in ("line", "to")
+             and abs(w.chars[0].origin[1] - 162) < 0.5]
+    label = model.erase(ErasePlan(0, words=words))
+    assert label == "Erase “line to”"
+    assert "Target edit" in " ".join(_page_text(model).split())
+    model.undo()
+    assert TARGET in _page_text(model)
+
+
+def test_erase_nothing_raises_and_changes_nothing(model):
+    import pymupdf as _p
+    with pytest.raises(te.EditError, match="nothing to erase"):
+        model.erase(ErasePlan(0, area=_p.Rect(300, 400, 400, 450)))
+    assert model.history_entries() == ["Original"]
+    assert TARGET in _page_text(model)
+
+
+def test_erase_then_save(model, tmp_path):
+    words = [w for w in model.words(0) if w.text == "Quarterly"]
+    model.erase(ErasePlan(0, words=words, fill=FILL_COLOR))
+    out = tmp_path / "erased.pdf"
+    model.save_document(str(out))
+    saved = pymupdf.open(str(out))
+    assert "Quarterly" not in saved[0].get_text()
+    assert "Report" in saved[0].get_text()
+    saved.close()
+
+
+def test_history_depth_is_bounded_by_memory(sample_pdf_path, monkeypatch):
+    """Every undo step holds a full copy of the document, so big files get
+    fewer steps (but never fewer than MIN_HISTORY)."""
+    import editor
+    m = EditorModel()
+    m.open_document(str(sample_pdf_path))
+    assert m.history.limit == editor.HISTORY_LIMIT        # small file: full depth
+    monkeypatch.setattr(editor, "HISTORY_BUDGET", 1)
+    m.open_document(str(sample_pdf_path))
+    assert m.history.limit == editor.MIN_HISTORY
+    m.close_document()
+
+
+def test_edits_work_on_pages_with_annotations(model):
+    """Regression: the annotation safety check crashed on any page that had
+    an annotation or link (PyMuPDF returns triples from annot_xrefs)."""
+    page = model.get_page(0)
+    page.insert_link({"kind": pymupdf.LINK_URI, "from": pymupdf.Rect(300, 400, 350, 420),
+                      "uri": "https://example.com"})
+    page.add_text_annot((400, 500), "a sticky note")
+    model.record_snapshot("Annotated")
+    # (get_links() caches per page object, so compare the annotation list.)
+    before = sorted(entry[1] for entry in model.get_page(0).annot_xrefs())
+    assert {pymupdf.PDF_ANNOT_TEXT, pymupdf.PDF_ANNOT_LINK} <= set(before)
+    _edit(model, TARGET, "Edited next to a link")
+    assert "Edited next to a link" in _page_text(model)
+    assert sorted(entry[1] for entry in model.get_page(0).annot_xrefs()) == before

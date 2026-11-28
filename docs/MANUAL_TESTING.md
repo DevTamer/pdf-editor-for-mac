@@ -146,6 +146,10 @@ Use a few real PDFs:
       cancels.
 - [ ] The saved file opens correctly in Preview and in a browser, and shows
       the edits.
+- [ ] A PDF with restrictions (e.g. made in Preview: File → Export as
+      PDF, Permissions…, with an owner password): after editing and saving,
+      Preview's Inspector (Cmd+I, the lock tab) shows the same
+      restrictions, and the owner password still unlocks them.
 - [ ] File → Metadata on Save: with the default, Preview's Inspector (Cmd+I)
       shows today's modification date and the original title, author and
       creator. With "Remove Document Info" it shows none of them. The

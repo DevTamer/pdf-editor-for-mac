@@ -71,6 +71,12 @@ new file, not changes appended to the old one, so nothing of the earlier
 version is left inside it. Edits go straight into the page itself, not
 onto an extra layer or annotation.
 
+**Security restrictions are kept.** A PDF that opens without a password
+but has restrictions set by its owner (no copying, no changes, printing
+only...) saves with the same encryption, the same restrictions and the
+same owner password, so whoever set them can still lift them. (PDFs that
+need a password just to open aren't supported yet.)
+
 **File → Metadata on Save** decides what happens to the document's
 metadata (title, author, dates, the app that made it). It's one setting
 for all windows, remembered between launches:
@@ -262,6 +268,10 @@ The suite has these parts:
   words, ligatures), Replace, and Replace All as one verified,
   all-or-nothing step.
 - `test_metadata.py` covers what saving does with metadata.
+- `test_encryption.py` covers keeping encryption and restrictions, in
+  each standard encryption scheme
+  (`tests/fixtures/make_encrypted_samples.sh` makes the samples with
+  qpdf).
 - `test_fontmatch.py` covers font matching: names, the font index and its
   cache, licences, lookalikes and editing with installed fonts. It uses
   real macOS fonts, made "installed" one at a time so results don't

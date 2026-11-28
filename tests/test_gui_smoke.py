@@ -1215,3 +1215,12 @@ def test_many_drag_sizes_dont_blank_highlights_on_screen(app):
         app.canvas.delete("scratch")
     alive = set(app.window.tk.splitlist(app.window.tk.call("image", "names")))
     assert names <= alive
+
+
+def test_opening_a_restricted_pdf_says_saving_keeps_the_restrictions(app, tmp_path):
+    from conftest import FIXTURES
+    import shutil
+    path = tmp_path / "restricted.pdf"
+    shutil.copy(FIXTURES / "encrypted_aes_256.pdf", path)
+    assert app.open_path(str(path))
+    assert "security restrictions, and saving keeps them" in app.status_label["text"]
